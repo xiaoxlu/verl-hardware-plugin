@@ -17,6 +17,16 @@ can simply be deleted. The patch modules are:
 - ``worker_local_rank_patch``: ``LOCAL_RANK`` from ``TPU_VISIBLE_CHIPS`` and
   no eager ``set_device`` in ``CheckpointEngineWorker`` (``Worker``).
 
+Trainer-side patches (lazy: their targets are heavy verl modules that are only
+imported in trainer workers, so they are installed by the ``Worker`` patch once
+the worker class has been imported, never imported just to be patched):
+
+- ``separation_cpu_copy_patch``: TorchTitan CPU save/restore handlers for the
+  ``separate_async`` actor worker (``DetachActorWorker``).
+- ``ppo_loss_patch``: ``ppo_loss`` that consumes the engine's differentiable
+  ``_tpu_padded_values`` (``verl.workers.utils.losses`` /
+  ``verl.workers.engine_workers``).
+
 Every patch is idempotent and only installs itself when its target module is
 fully imported, because ``PlatformTPU()`` may be constructed from a
 module-level ``get_device_name()`` call while heavier verl modules are still
@@ -44,6 +54,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _PATCHES: tuple[tuple[str, str, bool], ...] = (
     ("verl.single_controller.ray.base", "verl_hardware_plugin.patches.tpu.ray_resource_pool_patch", True),
     ("verl.single_controller.base.worker", "verl_hardware_plugin.patches.tpu.worker_local_rank_patch", True),
+    (
+        "verl.experimental.separation.engine_workers",
+        "verl_hardware_plugin.patches.tpu.separation_cpu_copy_patch",
+        False,
+    ),
+    ("verl.workers.engine_workers", "verl_hardware_plugin.patches.tpu.ppo_loss_patch", False),
 )
 
 

@@ -50,6 +50,15 @@ through; **both are temporary and should be deleted once upstream `verl` calls t
 | `ray_resource_pool_patch` | **`TaskRunner` actor** (on the head/coordinator node, where resource pools and placement groups are created) | `RayResourcePool.__init__` / `get_placement_groups` | `auto_assign_accelerator_type` (assigns each pool to a `tpu-group-<n>` slice with sufficient free `TPU` capacity) and `configure_placement_group_bundle`. | Upstream `verl` calls `auto_assign_accelerator_type` and `configure_placement_group_bundle` in `RayResourcePool`. |
 | `worker_local_rank_patch` | **Every verl `Worker` & `CheckpointEngineWorker` actor** (on the TPU worker nodes) | `Worker._setup_env_cuda_visible_devices` | `ray_local_rank_override` (`LOCAL_RANK` from `TPU_VISIBLE_CHIPS`) and skips eager `set_device` in `CheckpointEngineWorker`. | Upstream `verl` calls `ray_local_rank_override` in `Worker._setup_env_cuda_visible_devices`. |
 
+Two more patches are trainer-side glue for `TorchTitanTPUEngineWithLMHead` on verl main. They are
+lazy: their targets are only imported by trainer workers, so the `Worker` patch installs them from
+`Worker.__init__`, before `init_model`:
+
+| Patch | Process where it executes | verl call site | What it does | Removal condition |
+|---|---|---|---|---|
+| `separation_cpu_copy_patch` | **`TaskRunner` & trainer `WorkerDict` actors** | `DetachActorWorker._get_strategy_handlers` (`verl/experimental/separation/engine_workers.py`) | Adds TorchTitan CPU save/restore handlers (local DTensor shards). Without it, `save_model_to_cpu`, which `trainer_separate_async` calls every step, raises `NotImplementedError: Unsupported strategy: torchtitan`. | Upstream `verl` registers TorchTitan handlers. |
+| `ppo_loss_patch` | **Trainer `WorkerDict` actors** | `verl.workers.utils.losses.ppo_loss` (bound by `ActorRolloutRefWorker.init_model`) | Computes the policy loss from the engine's differentiable, bucket-padded `_tpu_padded_values`. verl's `ppo_loss` reads the detached CPU copy instead: shape mismatch against the bucketed `max_response_len`, or no autograd path to the model. | Upstream `verl`'s loss consumes `_tpu_padded_values` (verl-project/verl#7231). |
+
 verl main also does not call `PlatformTPU.get_ray_init_kwargs()`, so the Ray
 `worker_process_setup_hook` that installs these patches in every Ray worker process has to be set on
 the command line:
@@ -118,3 +127,8 @@ check the log with `tests/special_tpu/verify_tpu_e2e_log.py grpo <log> 1` and th
 `Registered rollout replica loader: vllm (TPU-aware)`, no `Traceback` during training and no
 `IsFusibleUnalignedDUS`. Cover `checkpoint_engine.backend=tpu` twice on the same pods (cold, then
 warm compile cache).
+
+On verl main, also pass `actor_rollout_ref.ref.torchtitan.use_torch_compile=False`: verl main's
+`trainer/config/ref/torchtitan_ref.yaml` does not inherit the actor's `use_torch_compile`, so the
+reference model is compiled with the `tpu` backend, and the first new sequence bucket fails with
+`TPU backend: does not support dynamic shape`.
