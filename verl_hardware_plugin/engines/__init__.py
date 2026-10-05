@@ -165,10 +165,14 @@ def register_all_engines():
     except Exception as e:
         logger.debug("SUPA Megatron engines not registered: %s", e)
 
-    # Google TPU checkpoint engine (Ray object store + host weight sync)
+    # Google TPU engines (TorchTitan trainer + Ray/Raiden checkpoint engines)
     try:
-        from verl_hardware_plugin.engines import torchtitan_tpu, tpu_checkpoint_engine  # noqa: F401
+        from verl_hardware_plugin.engines import (  # noqa: F401
+            raiden_checkpoint_engine,
+            torchtitan_tpu,
+            tpu_checkpoint_engine,
+        )
 
-        logger.info("Registered engines: tpu_checkpoint_engine")
+        logger.info("Registered engines: torchtitan_tpu, tpu_checkpoint_engine, raiden_checkpoint_engine")
     except Exception as e:
-        logger.debug("TPU Checkpoint engine not registered: %s", e)
+        logger.debug("TPU engines not registered: %s", e)
