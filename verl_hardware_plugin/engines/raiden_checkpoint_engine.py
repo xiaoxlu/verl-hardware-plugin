@@ -33,10 +33,6 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-# Sampler WeightSynchronizer listener base port (chosen well outside KubeRay's
-# raylet worker port range 10002..19999 to avoid multi-host port collisions).
-RAIDEN_SAMPLER_LISTENER_BASE_PORT = 39200
-
 
 def compute_tensor_stats(items: Iterable[Any]) -> dict[str, Any]:
     """Computes deterministic L1/L2 norms and parameter counts across tensors on device."""
@@ -108,13 +104,38 @@ def _unwrap_tensor(t: Any) -> Any:
     return t.to_local().data if hasattr(t, "to_local") else (t.data if hasattr(t, "data") else t)
 
 
-def filter_tied_embeddings(named_items: Iterable[tuple[str, Any]]) -> list[tuple[str, Any]]:
-    """Excludes redundant ``lm_head`` weights if embedding tokens are present."""
+def filter_tied_embeddings(
+    named_items: Iterable[tuple[str, Any]], tie_word_embeddings: bool = True
+) -> list[tuple[str, Any]]:
+    """Drops ``lm_head.weight`` from the weights to send when it is tied to the input embedding.
+
+    For tied models (``tie_word_embeddings=True``, e.g. Qwen3-0.6B / 4B), ``lm_head.weight`` is the same
+    tensor as ``embed_tokens.weight``, so it is not sent; the sampler copies ``embed_tokens`` into its
+    ``lm_head`` after receiving the weights.
+
+    For untied models (``tie_word_embeddings=False``, e.g. Qwen3-8B and larger), ``lm_head.weight`` is a
+    separate trained weight and is kept. Dropping it would leave the sampler with a wrong ``lm_head``
+    (stale, or overwritten with ``embed_tokens``).
+
+    Args:
+        named_items: ``(name, tensor)`` pairs in HF naming.
+        tie_word_embeddings: ``hf_config.tie_word_embeddings`` of the trained model.
+
+    Returns:
+        The ``(name, tensor)`` pairs to send.
+    """
     items = list(named_items)
     has_embed = any("embed_tokens" in k or "tok_embeddings" in k for k, _ in items)
-    if has_embed:
+    if has_embed and tie_word_embeddings:
         items = [(k, v) for k, v in items if not (k == "lm_head.weight" or k.endswith(".lm_head.weight"))]
     return items
+
+
+def _as_bool(value: Any) -> bool:
+    """Parses a bool flag that may arrive as a string (env var, CLI override) as well as a bool."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def validate_and_sanitize_tensors(
@@ -172,19 +193,24 @@ def _dim0_shard_info(spec: Any) -> tuple[tuple[int, ...], int, int] | None:
     return tuple(place.local_shape), num_shards, int(place.global_offset[0]) // (full_dim0 // num_shards)
 
 
-def export_local_shards(engine: Any) -> tuple[list[tuple[str, torch.Tensor]], dict[str, tuple[int, int]]]:
+def export_local_shards(
+    engine: Any, tie_word_embeddings: bool = True
+) -> tuple[list[tuple[str, torch.Tensor]], dict[str, tuple[int, int]]]:
     """Exports this rank's weights for Raiden without all-gathering FSDP shards.
 
     Returns ``(named_tensors, shard_info)``. ``shard_info[name] = (num_shards, shard_index)`` for tensors
     exported as a local dim-0 shard; tensors absent from it are full (replicated) on every rank. Tensors
     whose layout Raiden cannot express are all-gathered here, in the same order on every rank.
+    ``lm_head.weight`` is dropped only for tied models (see ``filter_tied_embeddings``).
     """
     from torch.distributed.tensor import DTensor
 
     from verl.workers.engine.spec import BlockPlacement, derive_dtensor_placement
 
     gen, _ = engine.get_per_tensor_param_shard()
-    items = filter_tied_embeddings((name, (local, spec)) for name, local, spec in gen)
+    items = filter_tied_embeddings(
+        ((name, (local, spec)) for name, local, spec in gen), tie_word_embeddings=tie_word_embeddings
+    )
 
     named: list[tuple[str, torch.Tensor]] = []
     shard_info: dict[str, tuple[int, int]] = {}
@@ -241,6 +267,276 @@ def merge_rank_stats(rank_stats: dict[Any, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+class RaidenParityCheck:
+    """Raiden weight-sync verification, selected by ``engine_kwargs.raiden.verify_parity``.
+
+    Two complementary checks:
+
+    * ``"norm"`` (or ``True``): on every sync from step 1, the trainer ranks post per-tensor L1/L2 stats and the
+      orchestrator compares them with the samplers' stats after the install (``verify_norms``). Cheap, but blind to
+      misplaced bytes: a reordered or mis-sliced tensor keeps its norms.
+    * ``"exact"``: on the step-0 sync of a fresh run, when the trainer weights equal the checkpoint vLLM loaded,
+      every sampler worker compares each received tensor bit for bit with the vLLM parameter it is about to
+      overwrite (``check_exact``) and returns the result (``exact_result``); the orchestrator logs one summary for
+      all ranks (``report_exact``). Catches any wrong byte (shard slice, tiling, fusion/transpose). Use it after
+      changing sharding or upgrading tpu-sync / torch-tpu. Cost: ~0.4 s once per rank (Qwen3-32B, TP32).
+
+    ``"all"`` enables both; ``False`` / ``"off"`` (default) neither.
+    """
+
+    MODES = ("off", "norm", "exact", "all")
+    MAX_DETAIL_LINES = 60
+
+    def __init__(self, mode: Any = "off") -> None:
+        self.mode = self.parse_mode(mode)
+        self.checked = 0
+        self.mismatched: list[str] = []
+
+    @classmethod
+    def parse_mode(cls, value: Any) -> str:
+        if value is None or value is False:
+            return "off"
+        if value is True:
+            return "norm"
+        mode = str(value).strip().lower()
+        mode = {"false": "off", "0": "off", "none": "off", "true": "norm", "1": "norm"}.get(mode, mode)
+        if mode not in cls.MODES:
+            raise ValueError(f"verify_parity must be a bool or one of {cls.MODES}, got {value!r}")
+        return mode
+
+    @classmethod
+    def from_config(cls, engine_kwargs: Any) -> "RaidenParityCheck":
+        """Reads ``engine_kwargs.raiden.verify_parity``, the same key the trainer's RaidenCheckpointEngine receives."""
+        if engine_kwargs is None:
+            return cls("off")
+        raiden_kwargs = engine_kwargs.get("raiden") or {}
+        return cls(raiden_kwargs.get("verify_parity", engine_kwargs.get("verify_parity", False)))
+
+    @property
+    def norm(self) -> bool:
+        return self.mode in ("norm", "all")
+
+    @property
+    def exact(self) -> bool:
+        return self.mode in ("exact", "all")
+
+    # ---- exact check: orchestrator side ----
+
+    def exact_install_kwargs(self, global_steps: int | None) -> dict[str, Any]:
+        """kwargs for the samplers' ``install_raiden_weights`` RPC: request the exact check on the step-0 sync only.
+
+        Later syncs (and the first sync after resuming from a checkpoint) carry trained weights, which no longer
+        match what vLLM loaded, so the exact check cannot run there.
+        """
+        return {"exact_parity": True} if self.exact and not global_steps else {}
+
+    @classmethod
+    def report_exact(cls, global_steps: int | None, install_results: list[Any]) -> bool:
+        """Logs one summary of the per-rank ``exact_result`` dicts that every sampler worker returns under
+        ``install_raiden_weights(...)["exact_parity"]``."""
+        results = [
+            w["exact_parity"]
+            for res in install_results
+            for w in (res if isinstance(res, list | tuple) else [res])
+            if isinstance(w, dict) and isinstance(w.get("exact_parity"), dict)
+        ]
+        step = global_steps or 0
+        if not results:
+            logger.warning("[RAIDEN PARITY EXACT | Step %s] no sampler returned a result", step)
+            return False
+        results.sort(key=lambda r: r["rank"])
+        num_mismatched = sum(r["num_mismatched"] for r in results)
+        num_unresolved = sum(len(r["unresolved"]) for r in results)
+        checked_per_rank = sorted({r["checked"] for r in results})
+        summary = (
+            f"[RAIDEN PARITY EXACT | Step {step}] {len(results)} sampler ranks, {checked_per_rank} tensors checked "
+            f"per rank, {num_mismatched} mismatched, {num_unresolved} unresolved"
+        )
+        if num_mismatched == 0 and num_unresolved == 0:
+            logger.info("%s: every received tensor matches the checkpoint bit for bit", summary)
+            return True
+        details = [f"  * rank {r['rank']}: {line}" for r in results for line in r["mismatched"]]
+        details += [f"  * rank {r['rank']}: unresolved {r['unresolved'][:5]}" for r in results if r["unresolved"]]
+        detail_text = "\n".join(details[: cls.MAX_DETAIL_LINES])
+        logger.error("%s\n%s", summary, detail_text)
+        return False
+
+    # ---- exact check: sampler worker side ----
+
+    @torch.no_grad()
+    def check_exact(self, name: str, target: torch.Tensor, received: torch.Tensor) -> None:
+        """Compares ``received`` with ``target``; call before ``target`` is overwritten."""
+        try:
+            ref, new = target.detach().float(), received.detach().float()
+            if ref.shape != new.shape:
+                self.mismatched.append(f"{name}: shape target={tuple(ref.shape)} received={tuple(new.shape)}")
+                return
+            self.checked += 1
+            diff = (ref - new).abs().max().item()
+            if diff != 0.0:
+                self.mismatched.append(
+                    f"{name}: max|diff|={diff:.4g} ref_absmean={ref.abs().mean().item():.4g} "
+                    f"recv_absmean={new.abs().mean().item():.4g}"
+                )
+        except Exception as e:  # never break the sync because of the check
+            self.mismatched.append(f"{name}: parity check failed: {e}")
+
+    def exact_result(self, rank: int, unresolved: list[str]) -> dict[str, Any]:
+        return {
+            "rank": rank,
+            "checked": self.checked,
+            "num_mismatched": len(self.mismatched),
+            "mismatched": self.mismatched[: self.MAX_DETAIL_LINES],
+            "unresolved": list(unresolved),
+        }
+
+    # ---- norm check: orchestrator side ----
+
+    async def verify_norms(self, manager: Any, global_steps: int | None = None) -> None:
+        """Compares distributed norms between the trainer ranks and the sampler TP workers."""
+        step_key = global_steps if global_steps is not None else 0
+        if step_key <= 0:
+            return
+
+        try:
+            registry = get_or_create_ray_weight_registry()
+            if registry is None:
+                return
+            num_trainer_ranks = manager.actor_wg.world_size
+            trainer_entry = None
+            for _ in range(25):
+                entry = await registry.get_stats.remote(step_key)
+                # Sharded export: every trainer rank posts partial stats, usable once all have arrived.
+                if entry is not None and ("ranks" not in entry or len(entry["ranks"]) >= num_trainer_ranks):
+                    trainer_entry = entry
+                    break
+                await asyncio.sleep(0.5)
+
+            sampler_futures = [
+                replica.server_handle.collective_rpc.remote(
+                    method="get_model_weights_stats", kwargs={"include_shards": False}
+                )
+                for replica in manager.replicas
+            ]
+            sampler_entries = await asyncio.gather(*sampler_futures)
+
+            if not trainer_entry or not sampler_entries:
+                logger.warning("[RAIDEN PARITY] Incomplete stats data for step %s", step_key)
+                return
+
+            sampler_workers = [
+                w
+                for res in sampler_entries
+                for w in (res if isinstance(res, list | tuple) else [res])
+                if isinstance(w, dict)
+            ]
+            if not sampler_workers:
+                return
+
+            if "ranks" in trainer_entry:
+                trainer_master = merge_rank_stats(trainer_entry["ranks"])
+            else:
+                trainer_master = trainer_entry.get("master", trainer_entry)
+            trainer_per_tensor = trainer_master.get("per_tensor", {})
+            all_param_names = list(sampler_workers[0].get("per_tensor", {}).keys()) if sampler_workers else []
+
+            total_trainer_numel = trainer_master.get("total_numel", 0)
+            total_trainer_l1 = trainer_master.get("l1_norm", 0.0)
+            global_trainer_l2 = trainer_master.get("l2_norm", 0.0)
+
+            total_sampler_l1, total_sampler_l2_sq, total_sampler_numel = 0.0, 0.0, 0
+            mismatches = []
+
+            for name in all_param_names:
+                s_numels = [w.get("per_tensor", {}).get(name, {}).get("numel", 0) for w in sampler_workers]
+                s_l1s = [w.get("per_tensor", {}).get(name, {}).get("l1", 0.0) for w in sampler_workers]
+                s_l2_sqs = [
+                    w.get("per_tensor", {})
+                    .get(name, {})
+                    .get("l2_sq", w.get("per_tensor", {}).get(name, {}).get("l2", 0.0) ** 2)
+                    for w in sampler_workers
+                ]
+                s_replicas = [w.get("per_tensor", {}).get(name, {}).get("replicas") for w in sampler_workers]
+
+                is_replicated = (
+                    len(set(s_numels)) == 1
+                    and (name.endswith("layernorm.weight") or "norm" in name)
+                    and len(s_numels[0:1]) > 0
+                    and s_numels[0] < 10000
+                )
+                if all(r for r in s_replicas):
+                    # Each slice is held by `replicas` ranks (GQA k/v heads, unsharded norms): count it once.
+                    s_agg_numel = round(sum(n / r for n, r in zip(s_numels, s_replicas, strict=True)))
+                    s_agg_l1 = sum(v / r for v, r in zip(s_l1s, s_replicas, strict=True))
+                    s_agg_l2 = sum(v / r for v, r in zip(s_l2_sqs, s_replicas, strict=True)) ** 0.5
+                elif is_replicated:
+                    s_agg_numel = s_numels[0]
+                    s_agg_l1 = s_l1s[0]
+                    s_agg_l2 = s_l2_sqs[0] ** 0.5
+                else:
+                    s_agg_numel = sum(s_numels)
+                    s_agg_l1 = sum(s_l1s)
+                    s_agg_l2 = sum(s_l2_sqs) ** 0.5
+
+                t_data = trainer_per_tensor.get(name, {})
+                t_agg_numel = t_data.get("numel", 0)
+                t_agg_l1 = t_data.get("l1", 0.0)
+
+                total_sampler_numel += s_agg_numel
+                total_sampler_l1 += s_agg_l1
+                total_sampler_l2_sq += s_agg_l2**2
+
+                delta_numel = abs(s_agg_numel - t_agg_numel)
+                delta_l1 = abs(s_agg_l1 - t_agg_l1)
+                rel_tol = 1e-3 * max(abs(t_agg_l1), 1.0)
+
+                if delta_numel != 0 or delta_l1 > rel_tol:
+                    mismatches.append(f"  * {name}: Trainer(L1={t_agg_l1:.4f}) vs Sampler(L1={s_agg_l1:.4f})")
+
+            global_sampler_l2 = total_sampler_l2_sq**0.5
+            total_l1_delta = abs(total_sampler_l1 - total_trainer_l1)
+            total_l2_delta = abs(global_sampler_l2 - global_trainer_l2)
+            total_numel_delta = abs(total_sampler_numel - total_trainer_numel)
+            total_rel_tol = 1e-3 * max(abs(total_trainer_l1), 1.0)
+
+            if not mismatches and total_numel_delta == 0 and total_l1_delta <= total_rel_tol:
+                logger.info(
+                    "[RAIDEN PARITY VERIFIED | Step %s] 100%% DISTRIBUTED NORM PARITY CONFIRMED!\n"
+                    "  * Global L1 Norm: %.6f (Trainer=%.6f, delta=%.6f)\n"
+                    "  * Global L2 Norm: %.6f (Trainer=%.6f, delta=%.6f)\n"
+                    "  * Total Parameters: %d across %d tensors",
+                    step_key,
+                    total_sampler_l1,
+                    total_trainer_l1,
+                    total_l1_delta,
+                    global_sampler_l2,
+                    global_trainer_l2,
+                    total_l2_delta,
+                    total_sampler_numel,
+                    len(all_param_names),
+                )
+            else:
+                mismatches_summary = "\n".join(mismatches[:10])
+                logger.error(
+                    "[RAIDEN PARITY MISMATCH | Step %s] Norms do NOT match!\n"
+                    "  * Trainer: numel=%d, L1=%.6f, L2=%.6f\n"
+                    "  * Sampler: numel=%d, L1=%.6f, L2=%.6f\n"
+                    "  * Mismatched Tensors (%d / %d):\n%s",
+                    step_key,
+                    total_trainer_numel,
+                    total_trainer_l1,
+                    global_trainer_l2,
+                    total_sampler_numel,
+                    total_sampler_l1,
+                    global_sampler_l2,
+                    len(mismatches),
+                    len(all_param_names),
+                    mismatches_summary,
+                )
+        except Exception as e:
+            logger.warning("Error during parity verification for step %s: %s", step_key, e)
+
+
 def setup_raiden_controller() -> tuple[Any, Any, str]:
     """Starts an embedded ``RaidenControllerServer`` on the head node and records its address in the registry."""
     from tpu_sync.rpc import raiden_controller
@@ -278,7 +574,8 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self.is_master = is_master
         self.bucket_size = bucket_size
         self.backend = "raiden"
-        self.verify_parity = kwargs.get("verify_parity", False)
+        # Trainer ranks only post L1/L2 stats for the norm check; the exact check runs on the samplers.
+        self.verify_parity = RaidenParityCheck(kwargs.get("verify_parity", False)).norm
         self.parallelism = kwargs.get("parallelism", 8)
         self.tp_size = kwargs.get("tp_size", kwargs.get("tensor_parallel_size", self.parallelism))
         self._trainer_raiden_ws: Any = None
@@ -287,6 +584,20 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self._registered_signature: list[tuple[str, tuple[int, ...], torch.dtype, tuple[int, int] | None]] | None = None
         self._bound_tensors: list[torch.Tensor] | None = None
         self._shard_info: dict[str, tuple[int, int]] = {}
+        # Free the device tensors bound for a transfer once the controller push has read them, instead of keeping
+        # them until the next sync. With the local-shard export that is the bf16 copy of this rank's shards plus
+        # the full q/k/v, which the fused-wqkv save hook still all-gathers to every rank: ~3.4 GiB per chip for
+        # Qwen3-8B on 8 chips. With an all-gathered weights iterable it is the full bf16 model on every chip. The
+        # synchronizer pins the device buffers of every bound tensor (dropping the Python references frees
+        # nothing), so the release goes through WeightSynchronizer.unbind_weights(): the HBM holds are dropped
+        # while the synchronizer, its pinned host staging buffers and its controller registration stay alive for
+        # the next sync to rebind. On by default so the trainer keeps that headroom as models grow; opt out with
+        # the engine kwarg or VERL_RAIDEN_RELEASE_BUFFERS=0 to keep the send tensors resident between syncs.
+        release = _as_bool(kwargs.get("release_buffers_after_sync", True))
+        env_release = os.environ.get("VERL_RAIDEN_RELEASE_BUFFERS", "")
+        if env_release:
+            release = _as_bool(env_release)
+        self.release_buffers_after_sync = release
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -438,6 +749,7 @@ class RaidenCheckpointEngine(CheckpointEngine):
         global_steps: int | None = None,
         compute_stats: bool | None = None,
         compute_checksum: bool | None = None,
+        tie_word_embeddings: bool = True,
         **kwargs: Any,
     ) -> None:
         """Registers weights with ``RaidenController`` and prepares for coordinated P2P network transfer."""
@@ -455,10 +767,13 @@ class RaidenCheckpointEngine(CheckpointEngine):
             raise RuntimeError(f"TPU synchronization failed: {e}") from e
 
         if hasattr(weights, "get_per_tensor_param_shard"):
-            named_weights, self._shard_info = export_local_shards(weights)
+            # Handed the training engine: register each rank's local FSDP shard, no all-gather.
+            hf_config = getattr(getattr(weights, "model_config", None), "hf_config", None)
+            tie_word_embeddings = bool(getattr(hf_config, "tie_word_embeddings", tie_word_embeddings))
+            named_weights, self._shard_info = export_local_shards(weights, tie_word_embeddings=tie_word_embeddings)
         else:
             weight_items = weights.items() if hasattr(weights, "items") else weights
-            named_weights = filter_tied_embeddings(weight_items)
+            named_weights = filter_tied_embeddings(weight_items, tie_word_embeddings=tie_word_embeddings)
             self._shard_info = {}
 
         unfused_weights = {k: _unwrap_tensor(v) for k, v in named_weights}
@@ -467,13 +782,17 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
         torch_tpu_sync.synchronize(wait=True)
 
-        # Reuse the WeightSynchronizer across steps when the (name, shape, dtype, shard) signature is unchanged.
+        # Reuse the WeightSynchronizer across steps when the (name, shape, dtype, shard) signature is unchanged:
+        # rebinding keeps the DMA-mapped host buffers, listener/threads and controller registration, and only
+        # swaps the device buffers the D2H reads from (release_sync_buffers() unbinds them between syncs).
         signature = [(name, tuple(t.shape), t.dtype, self._shard_info.get(name)) for name, t in valid_weights]
         if self._trainer_raiden_ws is not None and signature == self._registered_signature:
             self._trainer_raiden_ws.bind_weights([[t] for _, t in valid_weights])
         else:
             await self._create_and_register(valid_weights)
             self._registered_signature = signature
+        # Keep the bound device buffers alive until the next sync (or release_sync_buffers()): the
+        # controller-driven push reads them after send_weights returns.
         self._bound_tensors = [t for _, t in valid_weights]
 
         # Note: No explicit ws.d2h() here. PushWeightsResharded (triggered by the controller's
@@ -504,6 +823,57 @@ class RaidenCheckpointEngine(CheckpointEngine):
         except Exception as e:
             logger.warning("Failed to record trainer rank %s stats in RayWeightRegistry: %s", self.rank, e)
 
+    def release_sync_buffers(self) -> dict[str, Any]:
+        """Frees this rank's bound send tensors after the P2P transfer, keeping the synchronizer when possible.
+
+        Must only be called after the controller transfer that reads them has completed. Runs by default; a
+        no-op when ``release_buffers_after_sync`` is disabled, in which case the bound tensors stay resident
+        between syncs.
+
+        With a ``tpu_sync`` build that exposes ``WeightSynchronizer.unbind_weights()`` the synchronizer's holds on
+        the bound device buffers are dropped, so dropping our own references returns the HBM. The synchronizer
+        itself, its pinned host staging buffers and its controller registration survive, and the next
+        ``send_weights`` rebinds through ``bind_weights()``. Compared to destroying and re-creating the
+        synchronizer each sync, this removes the per-step rebuild (host buffer allocation, pinning and first
+        touch, plus controller re-registration: ~2 s "Trainer init" + ~2 s release on Qwen3-8B, v6e-8) from
+        the sync critical path.
+
+        Older ``tpu_sync`` builds without ``unbind_weights`` fall back to destroying the synchronizer; the next
+        ``send_weights`` then re-creates and re-registers it.
+        """
+        if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
+            return {}
+        ws = self._trainer_raiden_ws
+        if hasattr(ws, "unbind_weights"):
+            ws.unbind_weights()
+            self._bound_tensors = None
+        else:
+            # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
+            # device tensors and the host staging memory) is destroyed when the last Python reference goes.
+            if not getattr(self, "_warned_no_unbind", False):
+                logger.warning(
+                    "Trainer Rank %s: tpu_sync WeightSynchronizer has no unbind_weights(); destroying it to free "
+                    "the send buffers each sync (upgrade tpu-sync-torch to keep the synchronizer across syncs).",
+                    self.rank,
+                )
+                self._warned_no_unbind = True
+            self._trainer_raiden_ws = None
+            self._bound_tensors = None
+            self._registered_signature = None
+            del ws
+            import gc
+
+            gc.collect()
+        # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
+        # TPU runtime reuses freed HBM without it.
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception:
+            pass
+        return {}
+
     @torch.no_grad()
     async def receive_weights(
         self,
@@ -524,14 +894,19 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
     _raiden_ws: Any = None
     _raiden_staging: dict[str, torch.Tensor]
     _sorted_vllm_params: list[tuple[str, torch.Tensor]]
+    _raiden_replicas: dict[str, int]
 
     def _get_vllm_model(self) -> Any:
         """Extracts the underlying ``nn.Module`` from the vLLM worker."""
         worker: Any = getattr(self, "worker", self)
         return worker.model_runner.model
 
-    def init_raiden_sync_on_worker(self, parallelism: int = 8) -> bool:
-        """Initializes Raiden ``WeightSynchronizer`` listener and registers with ``RaidenController``."""
+    def init_raiden_sync_on_worker(self, parallelism: int = 8, job_name: str = "sampler") -> bool:
+        """Initializes Raiden ``WeightSynchronizer`` listener and registers with ``RaidenController``.
+
+        ``job_name`` is the Raiden job this replica registers under; the orchestrator gives every rollout replica
+        its own name when there are several, so their ranks ``0..TP-1`` do not collide on the controller.
+        """
         if hasattr(self, "_raiden_ws") and self._raiden_ws is not None:
             return True
 
@@ -544,7 +919,10 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
-        listener_port = RAIDEN_SAMPLER_LISTENER_BASE_PORT + rank_val
+        # Let the OS pick the control listener port, as the trainer side does. ``rank`` is the rank inside this
+        # replica, so a fixed base + rank collides as soon as two replicas share a host. The port actually bound
+        # is read back from the synchronizer and registered with the controller below.
+        listener_port = 0
 
         registry = get_or_create_ray_weight_registry()
         if registry is None:
@@ -584,9 +962,13 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
 
         row_parallel_suffixes = (".o_proj.weight", ".down_proj.weight")
 
+        # TODO(tpu): Copy the received weights straight into vLLM's parameters, with no staging copy. The
+        # staging tensors are a second full copy of this rank's TP shard (~1.9 GiB per chip for Qwen3-8B at
+        # TP=8) that must fit next to vLLM's preallocated weights and KV cache on every sync.
         staging_tensors: dict[str, torch.Tensor] = {}
         variable_protos: list[Any] = []
         valid_params: list[tuple[str, torch.Tensor]] = []
+        replicas: dict[str, int] = {}
 
         for idx, (name, raw_g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(raw_g_shape)
@@ -602,6 +984,12 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
                     local_shape[0] = g_shape[0] // tp_size
 
             sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+            # Number of TP ranks holding this same slice: 1 for a plain split, tp_size for unsharded tensors
+            # (norms, 1-D biases). The norm parity check divides by it when summing over ranks.
+            mesh_size = 1
+            for m in sharding_mesh:
+                mesh_size *= m
+            replicas[name] = tp_size // mesh_size
 
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
             staging_tensors[name] = t
@@ -621,6 +1009,7 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
 
         self._raiden_staging = staging_tensors
         self._sorted_vllm_params = valid_params
+        self._raiden_replicas = replicas
 
         try:
             from torch_tpu._internal import sync as torch_tpu_sync
@@ -647,11 +1036,17 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
             bind_ip=bind_ip,
         )
 
+        # Whether a tensor can skip the CPU (de)tiling pass is decided by Raiden's planner per transfer, from the
+        # SOURCE and destination slices together, and delivered to this listener with the transfer. Setting it here
+        # from the local shape alone makes the two sides disagree whenever a trainer shard is not 8-row aligned
+        # (e.g. Qwen3's embedding at 32+ FSDP ranks): the sender de-tiles to row-major and h2d() copies those bytes
+        # raw into tiled HBM, permuting the weights while leaving every norm unchanged.
+
         try:
             from tpu_sync.rpc import raiden_controller
 
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
             ctrl_client.register_work_unit(
                 unit_id,
                 [f"{bind_ip}:{self._raiden_ws.local_port}"],
@@ -677,13 +1072,22 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
         return True
 
     @torch.no_grad()
-    def install_raiden_weights(self) -> int:
+    def install_raiden_weights(self, exact_parity: bool = False) -> dict[str, Any]:
         """Installs received weights from host staging buffers into TPU HBM via zero-copy H2D DMA
         and fuses/transposes them into vLLM model parameters.
+
+        Args:
+            exact_parity: Set by ``RaidenParityCheck`` on the step-0 sync: compare every received tensor bit for
+                bit with the vLLM parameter it overwrites.
+
+        Returns:
+            Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_raiden_ws.h2d()``)
+            and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's
+            ``RaidenParityCheck.exact_result``) when requested. Empty if the synchronizer is not initialized.
         """
         if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
             logger.warning("Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized.")
-            return 0
+            return {}
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
@@ -734,6 +1138,7 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
         ]
 
         consumed_staging: set[str] = set()
+        parity: RaidenParityCheck | None = RaidenParityCheck("exact") if exact_parity else None
 
         # 1. Handle fused projections (QKV and Gate-Up)
         for target_suffix, src_suffixes in fused_map:
@@ -754,10 +1159,13 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
                             parts = [self._raiden_staging[sk] for sk in layer_src_keys]
                             fused = torch.cat(parts, dim=0)
                             fused_adapted = to_target_layout(fused, target_local, is_flipped)
+                            if parity is not None:
+                                parity.check_exact(resolved_key, target_local, fused_adapted)
                             target_local.copy_(fused_adapted)
                             consumed_staging.update(layer_src_keys)
 
         # 2. Handle remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
+        unresolved: list[str] = []
         for name, src_t in self._raiden_staging.items():
             if name in consumed_staging:
                 continue
@@ -768,10 +1176,18 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
                 parent_mod = get_parent_mod(resolved_key)
                 is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
                 adapted = to_target_layout(src_t, target_local, is_flipped)
+                if parity is not None:
+                    parity.check_exact(resolved_key, target_local, adapted)
                 target_local.copy_(adapted)
+            else:
+                unresolved.append(name)
 
-        # 3. Handle tied word embeddings
-        if (
+        # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
+        #    models (e.g. Qwen3-8B / 32B) the received lm_head must not be overwritten by embed_tokens.
+        received_lm_head = any(k == "lm_head.weight" or k.endswith(".lm_head.weight") for k in self._raiden_staging)
+        if received_lm_head:
+            pass
+        elif (
             hasattr(vllm_model, "lm_head")
             and hasattr(vllm_model, "model")
             and hasattr(vllm_model.model, "embed_tokens")
@@ -800,7 +1216,11 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
             t_h2d,
             t_sync,
         )
-        return 1
+        # Returned through collective_rpc so the orchestrator can log them as step metrics.
+        result: dict[str, Any] = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        if parity is not None:
+            result["exact_parity"] = parity.exact_result(getattr(self, "rank", 0), unresolved)
+        return result
 
     def get_model_weights_stats(self, include_shards: bool = False) -> dict[str, Any]:
         """Computes deterministic parameter count, L1 norm, and L2 norm across staging parameters."""
@@ -817,15 +1237,41 @@ class vLLMRaidenWorkerExtension(_BaseTPUWorkerExtension):  # type: ignore[misc]
         rank_val = getattr(self, "rank", 0)
         res = compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = rank_val
+        replicas = getattr(self, "_raiden_replicas", {})
+        for name, stats in res["per_tensor"].items():
+            if name in replicas:
+                stats["replicas"] = replicas[name]
         return res
+
+
+def _replica_num_workers(replica: Any) -> int:
+    """Number of Raiden work units a rollout replica registers: one per TP worker."""
+    if getattr(replica, "world_size", None):
+        return int(replica.world_size)
+    if getattr(replica, "workers", None):
+        return len(replica.workers)
+    return 1
+
+
+def _sampler_job_name(replica_idx: int, num_replicas: int) -> str:
+    """Raiden job name of a rollout replica: ``sampler`` with one replica, ``sampler<idx>`` with several.
+
+    A rollout worker registers as (job name, rank within its replica). With several replicas the ranks
+    ``0..TP-1`` would all collide under one name, and the controller would wait for ranks ``TP..N*TP-1`` that
+    nothing ever registers. One job name per replica keeps every registration unique; a single replica keeps
+    the historical name.
+    """
+    return "sampler" if num_replicas == 1 else f"sampler{replica_idx}"
 
 
 async def update_raiden_weights(
     manager: Any,
     global_steps: int | None = None,
-    verify_parity: bool = False,
 ) -> dict[str, Any]:
-    """Orchestrates Raiden TPU P2P weight synchronization via the embedded ``RaidenController``."""
+    """Orchestrates Raiden TPU P2P weight synchronization via the embedded ``RaidenController``.
+
+    Returns the per-phase timings as ``timing_s/tpu-sync/*`` metrics.
+    """
     t_abort_start = time.perf_counter()
     if global_steps and global_steps > 0:
         try:
@@ -834,10 +1280,8 @@ async def update_raiden_weights(
             logger.warning("Failed to abort replicas at step %s: %s", global_steps, e)
     t_abort = time.perf_counter() - t_abort_start
 
-    if hasattr(manager, "config") and hasattr(manager.config, "engine_kwargs"):
-        verify_parity = manager.config.engine_kwargs.get("raiden", {}).get(
-            "verify_parity", manager.config.engine_kwargs.get("verify_parity", verify_parity)
-        )
+    engine_kwargs = getattr(getattr(manager, "config", None), "engine_kwargs", None)
+    parity = RaidenParityCheck.from_config(engine_kwargs)
 
     # Lazily start the embedded RaidenControllerServer on the manager before trainer ranks register.
     if getattr(manager, "raiden_controller", None) is None:
@@ -853,42 +1297,43 @@ async def update_raiden_weights(
     t_init_trainer = time.perf_counter() - t_init_trainer_start
 
     parallelism = 8
-    if hasattr(manager, "config") and hasattr(manager.config, "engine_kwargs"):
-        parallelism = manager.config.engine_kwargs.get("raiden", {}).get(
-            "parallelism", manager.config.engine_kwargs.get("parallelism", 8)
-        )
+    if engine_kwargs is not None:
+        parallelism = (engine_kwargs.get("raiden") or {}).get("parallelism", engine_kwargs.get("parallelism", 8))
 
     # 2. Initialize and register Sampler rollout workers with central RaidenController
+    num_replicas = len(manager.replicas)
     t_init_sampler_start = time.perf_counter()
     sampler_init_futures = [
         replica.server_handle.collective_rpc.remote(
-            method="init_raiden_sync_on_worker", kwargs={"parallelism": parallelism}
+            method="init_raiden_sync_on_worker",
+            kwargs={"parallelism": parallelism, "job_name": _sampler_job_name(replica_idx, num_replicas)},
         )
-        for replica in manager.replicas
+        for replica_idx, replica in enumerate(manager.replicas)
     ]
     await asyncio.gather(*sampler_init_futures)
     t_init_sampler = time.perf_counter() - t_init_sampler_start
 
     # 3. Registration barrier on Central RaidenController
     t_barrier_start = time.perf_counter()
-    num_rollout_workers = 0
-    for r in manager.replicas:
-        if hasattr(r, "world_size") and r.world_size:
-            num_rollout_workers += r.world_size
-        elif hasattr(r, "workers") and r.workers:
-            num_rollout_workers += len(r.workers)
-        else:
-            num_rollout_workers += 1
-    if num_rollout_workers == 0:
-        num_rollout_workers = len(manager.replicas)
-    sampler_replica_ids = [str(i) for i in range(num_rollout_workers)]
+
+    # One group of destination units per rollout replica: ranks '0'..'TP-1' under the replica's own job name.
+    # Examples:
+    #   - 1 replica with TP=8: one group ['0'..'7'] under job "sampler".
+    #   - 3 replicas with TP=8: groups ['0'..'7'] under "sampler0", "sampler1", "sampler2".
     trainer_replica_ids = [str(i) for i in range(manager.actor_wg.world_size)]
 
     from tpu_sync.api.common import RaidenId
     from tpu_sync.rpc.raiden_controller import RaidenMemoryType
 
     src_units = [RaidenId(job_name="trainer", job_replica_id=r_id, data_name="weights") for r_id in trainer_replica_ids]
-    dst_units = [RaidenId(job_name="sampler", job_replica_id=r_id, data_name="weights") for r_id in sampler_replica_ids]
+    dst_unit_groups = [
+        [
+            RaidenId(job_name=_sampler_job_name(replica_idx, num_replicas), job_replica_id=str(k), data_name="weights")
+            for k in range(_replica_num_workers(replica))
+        ]
+        for replica_idx, replica in enumerate(manager.replicas)
+    ]
+    dst_units = [unit for group in dst_unit_groups for unit in group]
 
     barrier_timeout = 60.0
     while True:
@@ -915,28 +1360,55 @@ async def update_raiden_weights(
 
     # 4. Trigger coordinated P2P network transfers via central RaidenController
     t_transfer_start = time.perf_counter()
-    transfer_future = manager.raiden_controller.start_transfer(
-        src_units=src_units,
-        dst_units=dst_units,
-        dst_mem_type=RaidenMemoryType.DRAM,
-        use_block_chunks=True,
-        is_sender=True,
-        expected_block_count=0,
-        parallelism=parallelism,
-        req_id=f"verl_step_{global_steps or 0}",
-    )
-    await transfer_future.wait()
+    # One transfer per replica. Each has the destination mesh of the validated single-replica case ([1, TP]),
+    # instead of one transfer whose destination mixes the ranks of several meshes. The transfers are issued
+    # together and awaited together: the controller tracks each by its own req_id / uuid and the trainer ranks
+    # keep their D2H and skip-tiling state per uuid, so the replicas overlap instead of paying the per-transfer
+    # latency one after another. The trainer buffers are only released after every transfer has finished.
+    transfer_futures = []
+    for replica_idx, dst_group in enumerate(dst_unit_groups):
+        req_id = f"verl_step_{global_steps or 0}" + (f"_replica{replica_idx}" if num_replicas > 1 else "")
+        transfer_futures.append(
+            manager.raiden_controller.start_transfer(
+                src_units=src_units,
+                dst_units=dst_group,
+                dst_mem_type=RaidenMemoryType.DRAM,
+                use_block_chunks=True,
+                is_sender=True,
+                expected_block_count=0,
+                parallelism=parallelism,
+                req_id=req_id,
+            )
+        )
+    await asyncio.gather(*[future.wait() for future in transfer_futures])
     t_transfer = time.perf_counter() - t_transfer_start
+
+    # The trainer buffers are no longer read once the transfer is done; free them (unless disabled on the
+    # engine) while the samplers install, so the HBM is back before the next training step. Dispatched through
+    # the generic execute_checkpoint_engine RPC (DP_COMPUTE: one method name per rank).
+    release_refs = None
+    if hasattr(manager.actor_wg, "execute_checkpoint_engine"):
+        release_refs = manager.actor_wg.execute_checkpoint_engine(
+            ["release_sync_buffers"] * manager.actor_wg.world_size
+        )
 
     # 5. Sampler replicas install received weights to TPU HBM via H2D DMA
     t_install_start = time.perf_counter()
+    install_kwargs = parity.exact_install_kwargs(global_steps)
     install_futures = [
-        replica.server_handle.collective_rpc.remote(method="install_raiden_weights") for replica in manager.replicas
+        replica.server_handle.collective_rpc.remote(method="install_raiden_weights", kwargs=install_kwargs)
+        for replica in manager.replicas
     ]
-    await asyncio.gather(*install_futures)
+    install_results = await asyncio.gather(*install_futures)
     t_install = time.perf_counter() - t_install_start
+    # collective_rpc returns one result per TP worker of each replica; each is the timing dict returned by
+    # vLLMRaidenWorkerExtension.install_raiden_weights. The slowest worker gates the sync, so report the max.
+    worker_install_stats = [
+        r for per_replica in install_results for r in (per_replica or []) if isinstance(r, dict) and "h2d" in r
+    ]
+    t_h2d_pure = max((r["h2d"] for r in worker_install_stats), default=None)
 
-    # 6. Drop prefix/KV cache computed with the old weights and propagate global_steps
+    # 6. Drop prefix/KV cache computed with the old weights and tag new generations with this weight version
     cache_and_step_futures = []
     for replica in manager.replicas:
         cache_and_step_futures.append(replica.server_handle.clear_kv_cache.remote())
@@ -944,13 +1416,17 @@ async def update_raiden_weights(
             cache_and_step_futures.append(replica.server_handle.set_global_steps.remote(global_steps))
     if cache_and_step_futures:
         await asyncio.gather(*cache_and_step_futures)
+    if release_refs is not None:
+        await asyncio.to_thread(ray.get, release_refs)
 
     t_total = time.perf_counter() - t_total_start
 
-    # 7. Parity Verification (Optional, default=False)
-    if verify_parity:
+    # 7. Parity Verification (Optional, default=off; see RaidenParityCheck)
+    if install_kwargs:
+        parity.report_exact(global_steps, list(install_results))
+    if parity.norm:
         try:
-            await _verify_parity_async(manager, global_steps)
+            await parity.verify_norms(manager, global_steps)
         except Exception as e:
             logger.warning("Failed to execute parity verification: %s", e)
 
@@ -977,145 +1453,21 @@ async def update_raiden_weights(
     # 8. Resume generation immediately
     await manager.resume_generation_replicas()
 
-    return {}
-
-
-async def _verify_parity_async(manager: Any, global_steps: int | None = None) -> None:
-    """Compares distributed norms between Trainer ranks and Sampler TP workers."""
-    step_key = global_steps if global_steps is not None else 0
-    if step_key <= 0:
-        return
-
-    try:
-        registry = get_or_create_ray_weight_registry()
-        if registry is None:
-            return
-        num_trainer_ranks = manager.actor_wg.world_size
-        trainer_entry = None
-        for _ in range(25):
-            entry = await registry.get_stats.remote(step_key)
-            if entry is not None and ("ranks" not in entry or len(entry["ranks"]) >= num_trainer_ranks):
-                trainer_entry = entry
-                break
-            await asyncio.sleep(0.5)
-
-        sampler_futures = [
-            replica.server_handle.collective_rpc.remote(
-                method="get_model_weights_stats", kwargs={"include_shards": False}
-            )
-            for replica in manager.replicas
-        ]
-        sampler_entries = await asyncio.gather(*sampler_futures)
-
-        if not trainer_entry or not sampler_entries:
-            logger.warning("[RAIDEN PARITY] Incomplete stats data for step %s", step_key)
-            return
-
-        sampler_workers = [
-            w
-            for res in sampler_entries
-            for w in (res if isinstance(res, list | tuple) else [res])
-            if isinstance(w, dict)
-        ]
-        if not sampler_workers:
-            return
-
-        if "ranks" in trainer_entry:
-            trainer_master = merge_rank_stats(trainer_entry["ranks"])
-        else:
-            trainer_master = trainer_entry.get("master", trainer_entry)
-        trainer_per_tensor = trainer_master.get("per_tensor", {})
-        all_param_names = list(sampler_workers[0].get("per_tensor", {}).keys()) if sampler_workers else []
-
-        total_trainer_numel = trainer_master.get("total_numel", 0)
-        total_trainer_l1 = trainer_master.get("l1_norm", 0.0)
-        global_trainer_l2 = trainer_master.get("l2_norm", 0.0)
-
-        total_sampler_l1, total_sampler_l2_sq, total_sampler_numel = 0.0, 0.0, 0
-        mismatches = []
-
-        for name in all_param_names:
-            s_numels = [w.get("per_tensor", {}).get(name, {}).get("numel", 0) for w in sampler_workers]
-            s_l1s = [w.get("per_tensor", {}).get(name, {}).get("l1", 0.0) for w in sampler_workers]
-            s_l2_sqs = [
-                w.get("per_tensor", {})
-                .get(name, {})
-                .get("l2_sq", w.get("per_tensor", {}).get(name, {}).get("l2", 0.0) ** 2)
-                for w in sampler_workers
-            ]
-
-            is_replicated = (
-                len(set(s_numels)) == 1
-                and (name.endswith("layernorm.weight") or "norm" in name)
-                and len(s_numels[0:1]) > 0
-                and s_numels[0] < 10000
-            )
-            if is_replicated:
-                s_agg_numel = s_numels[0]
-                s_agg_l1 = s_l1s[0]
-                s_agg_l2 = s_l2_sqs[0] ** 0.5
-            else:
-                s_agg_numel = sum(s_numels)
-                s_agg_l1 = sum(s_l1s)
-                s_agg_l2 = sum(s_l2_sqs) ** 0.5
-
-            t_data = trainer_per_tensor.get(name, {})
-            t_agg_numel = t_data.get("numel", 0)
-            t_agg_l1 = t_data.get("l1", 0.0)
-
-            total_sampler_numel += s_agg_numel
-            total_sampler_l1 += s_agg_l1
-            total_sampler_l2_sq += s_agg_l2**2
-
-            delta_numel = abs(s_agg_numel - t_agg_numel)
-            delta_l1 = abs(s_agg_l1 - t_agg_l1)
-            rel_tol = 1e-3 * max(abs(t_agg_l1), 1.0)
-
-            if delta_numel != 0 or delta_l1 > rel_tol:
-                mismatches.append(f"  * {name}: Trainer(L1={t_agg_l1:.4f}) vs Sampler(L1={s_agg_l1:.4f})")
-
-        global_sampler_l2 = total_sampler_l2_sq**0.5
-        total_l1_delta = abs(total_sampler_l1 - total_trainer_l1)
-        total_l2_delta = abs(global_sampler_l2 - global_trainer_l2)
-        total_numel_delta = abs(total_sampler_numel - total_trainer_numel)
-        total_rel_tol = 1e-3 * max(abs(total_trainer_l1), 1.0)
-
-        if not mismatches and total_numel_delta == 0 and total_l1_delta <= total_rel_tol:
-            logger.info(
-                "[RAIDEN PARITY VERIFIED | Step %s] 100%% DISTRIBUTED NORM PARITY CONFIRMED!\n"
-                "  * Global L1 Norm: %.6f (Trainer=%.6f, delta=%.6f)\n"
-                "  * Global L2 Norm: %.6f (Trainer=%.6f, delta=%.6f)\n"
-                "  * Total Parameters: %d across %d tensors",
-                step_key,
-                total_sampler_l1,
-                total_trainer_l1,
-                total_l1_delta,
-                global_sampler_l2,
-                global_trainer_l2,
-                total_l2_delta,
-                total_sampler_numel,
-                len(all_param_names),
-            )
-        else:
-            mismatches_summary = "\n".join(mismatches[:10])
-            logger.error(
-                "[RAIDEN PARITY MISMATCH | Step %s] Norms do NOT match!\n"
-                "  * Trainer: numel=%d, L1=%.6f, L2=%.6f\n"
-                "  * Sampler: numel=%d, L1=%.6f, L2=%.6f\n"
-                "  * Mismatched Tensors (%d / %d):\n%s",
-                step_key,
-                total_trainer_numel,
-                total_trainer_l1,
-                global_trainer_l2,
-                total_sampler_numel,
-                total_sampler_l1,
-                global_sampler_l2,
-                len(mismatches),
-                len(all_param_names),
-                mismatches_summary,
-            )
-    except Exception as e:
-        logger.warning("Error during parity verification for step %s: %s", step_key, e)
+    # Surface the phase timers as step metrics (timing_s/update_weights ~= quiesce + total_sync).
+    metrics: dict[str, Any] = {
+        "timing_s/tpu-sync/quiesce": t_abort,
+        "timing_s/tpu-sync/trainer_init": t_init_trainer,
+        "timing_s/tpu-sync/sampler_init": t_init_sampler,
+        "timing_s/tpu-sync/barrier": t_barrier,
+        "timing_s/tpu-sync/p2p_transfer": t_transfer,
+        "timing_s/tpu-sync/sampler_h2d": t_install,
+        "timing_s/tpu-sync/total_sync": t_total,
+    }
+    if t_h2d_pure is not None:
+        # Pure _raiden_ws.h2d() time on the slowest sampler worker (sampler_h2d above also includes the
+        # fuse/transpose into vLLM params, the TPU sync barrier and the RPC round trip).
+        metrics["timing_s/tpu-sync/sampler_h2d_pure"] = t_h2d_pure
+    return metrics
 
 
 RAIDEN_WORKER_EXTENSION_CLS = "verl_hardware_plugin.engines.raiden_checkpoint_engine.vLLMRaidenWorkerExtension"
