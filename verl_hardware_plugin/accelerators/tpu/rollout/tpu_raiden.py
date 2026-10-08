@@ -11,13 +11,15 @@ methods on every vLLM worker through ``collective_rpc``:
 1. ``init_raiden_sync_on_worker``: allocate TP-sharded receive buffers for the tensors the trainer
    published and register them with the Raiden controller (first sync only).
 2. ``install_raiden_weights``: after the transfer, copy the received buffers to TPU HBM and fuse or
-   transpose them into vLLM's parameters (every sync).
-3. ``get_model_weights_stats``: weight norms for the optional parity check.
+   transpose them into vLLM's parameters (every sync); with ``exact_parity=True`` (step-0 sync of
+   ``verify_parity=exact|all``) also compare each received tensor bit for bit with the parameter it overwrites.
+3. ``get_model_weights_stats``: weight norms for the optional norm parity check.
 
 This module imports vLLM (through the upstream worker extension), so only vLLM workers import it.
 """
 
 import logging
+import math
 import os
 import time
 from typing import Any, Optional
@@ -37,8 +39,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# Each rollout worker receives transfers on this port plus its rank.
-RAIDEN_SAMPLER_LISTENER_BASE_PORT = 12000
 # How long a rollout worker waits for the controller address and the trainer's tensor shapes.
 _REGISTRY_POLL_ATTEMPTS = 30
 _REGISTRY_POLL_INTERVAL_S = 0.5
@@ -105,11 +105,16 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             f"global shapes found in RayWeightRegistry after timeout"
         )
 
-    def init_raiden_sync_on_worker(self, parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM) -> bool:
+    def init_raiden_sync_on_worker(
+        self, parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM, job_name: str = "sampler"
+    ) -> bool:
         """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
 
         Only the first call does work: the receive buffers, the synchronizer and the registration are
         reused by every later sync.
+
+        ``job_name`` is the Raiden job this replica registers under; the driver gives every rollout replica its
+        own name when there are several, so their ranks ``0..TP-1`` do not collide on the controller.
         """
         if getattr(self, "_raiden_ws", None) is not None:
             return True
@@ -123,7 +128,10 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
-        listener_port = RAIDEN_SAMPLER_LISTENER_BASE_PORT + rank_val
+        # Let the OS pick the control listener port, as the trainer side does. ``rank`` is the rank inside this
+        # replica, so a fixed ``base + rank`` collides as soon as two replicas share a host. The port actually
+        # bound is read back from the synchronizer and registered with the controller below.
+        listener_port = 0
 
         # 1. Fetch RaidenController address and un-fused global shapes from RayWeightRegistry
         controller_addr, global_shapes_map = self._wait_for_raiden_registry(rank_val)
@@ -149,11 +157,15 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         variable_protos = []
         valid_params = []
         skip_tiling_plan = []
+        # How many TP ranks hold each slice of a tensor: 1 for sharded tensors, ``tp_size`` for replicated ones
+        # (norms, indivisible embeddings). The parity check divides by it so every slice is counted once.
+        replicas: dict[str, int] = {}
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
             spec_axes, local_shape = _sampler_sharding(name, g_shape, tp_size)
             sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+            replicas[name] = tp_size // math.prod(sharding_mesh)
 
             # Allocate a local staging buffer with matching layout (the trainer sends bf16)
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device(raiden.RAIDEN_DEVICE))
@@ -176,6 +188,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         self._raiden_staging = staging_tensors
         self._sorted_vllm_params = valid_params
+        self._raiden_replicas = replicas
 
         raiden.tpu_synchronize()
 
@@ -198,7 +211,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         try:
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
             ctrl_client.register_work_unit(
                 unit_id,
                 [f"{bind_ip}:{self._raiden_ws.local_port}"],
@@ -212,20 +225,25 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             raise
         logger.info(
             f"Raiden Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
-            f"directly with RaidenController ({controller_addr}): mesh_shape=[1, {tp_size}], "
+            f"as {job_name!r} with RaidenController ({controller_addr}): mesh_shape=[1, {tp_size}], "
             f"data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
         )
 
         return True
 
     @torch.no_grad()
-    def install_raiden_weights(self) -> dict[str, float]:
+    def install_raiden_weights(self, exact_parity: bool = False) -> dict:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
         and fuse/transpose them directly into vLLM model parameters.
 
+        Args:
+            exact_parity: Set by ``RaidenParityCheck`` on the step-0 sync: compare every received tensor bit for
+                bit with the vLLM parameter it overwrites.
+
         Returns:
             Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_raiden_ws.h2d()``)
-            and ``sync`` (final TPU sync barrier). Empty if the synchronizer is not initialized.
+            and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's
+            ``RaidenParityCheck.exact_result``) when requested. Empty if the synchronizer is not initialized.
         """
         if getattr(self, "_raiden_ws", None) is None:
             logger.warning("Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized.")
@@ -243,6 +261,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         vllm_model = self._get_vllm_model()
         model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
         module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
+        parity = raiden.RaidenParityCheck("exact") if exact_parity else None
 
         def resolve_model_key(k: str) -> Optional[str]:
             resolved = _resolve_model_key(k, model_sd)
@@ -253,7 +272,10 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             target_local = target_param.to_local() if hasattr(target_param, "to_local") else target_param
             parent_mod = _get_parent_module(resolved_key, module_dict)
             is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
-            target_local.copy_(_to_target_layout(src, target_local, is_flipped))
+            adapted = _to_target_layout(src, target_local, is_flipped)
+            if parity is not None:
+                parity.check_exact(resolved_key, target_local, adapted)
+            target_local.copy_(adapted)
 
         consumed_staging = set()
 
@@ -271,12 +293,15 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
                             consumed_staging.update(layer_src_keys)
 
         # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
+        unresolved = []
         for name, src_t in self._raiden_staging.items():
             if name in consumed_staging:
                 continue
             resolved_key = resolve_model_key(name)
             if resolved_key is not None:
                 copy_into(resolved_key, src_t)
+            else:
+                unresolved.append(name)
 
         # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
         #    models (e.g. Qwen3-8B / 32B) the received lm_head must not be overwritten by embed_tokens.
@@ -304,10 +329,17 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             f"completed in {t_total:.4f}s (H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
         )
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
-        return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        result: dict[str, Any] = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        if parity is not None:
+            result["exact_parity"] = parity.exact_result(getattr(self, "rank", 0), unresolved)
+        return result
 
     def get_model_weights_stats(self) -> dict:
-        """Computes deterministic parameter count, L1 norm, and L2 norm of this worker's received weights."""
+        """Computes deterministic parameter count, L1 norm, and L2 norm of this worker's received weights.
+
+        Every per-tensor entry also carries ``replicas``, the number of TP ranks holding that slice, so the
+        parity check can count replicated tensors once.
+        """
         vllm_model = self._get_vllm_model()
         if vllm_model is None:
             return {"error": "No model found on worker"}
@@ -320,4 +352,8 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         res = raiden.compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = getattr(self, "rank", 0)
+        replicas = getattr(self, "_raiden_replicas", {})
+        for name, stats in res["per_tensor"].items():
+            if name in replicas:
+                stats["replicas"] = replicas[name]
         return res

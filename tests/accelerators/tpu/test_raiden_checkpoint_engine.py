@@ -176,6 +176,7 @@ class _FakeTpuSync:
             def __init__(self, device_tensors, local_port=0, parallelism=8, listener_port=0, bind_ip="", **kwargs):
                 self.tensors = [tensors[0] for tensors in device_tensors]
                 self.local_port = local_port or next(world.ports)
+                self.requested_listener_port = listener_port
                 self.listener_port = listener_port or next(world.ports)
                 self.parallelism = parallelism
                 self.bind_ip = bind_ip
@@ -326,9 +327,14 @@ class _FakeServer:
         self.global_steps = global_steps
 
 
-def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, **raiden_kwargs):
-    """A ``CheckpointEngineManager`` stand-in with ``num_replicas`` handles to one rollout server."""
-    server = _FakeServer(samplers, events)
+def _make_manager(engines, weights_for_rank, samplers, events, **raiden_kwargs):
+    """A ``CheckpointEngineManager`` stand-in.
+
+    ``samplers`` is the list of TP workers of the single rollout replica, or a list of such lists for several
+    replicas (each gets its own rollout server). Returns the manager and the first replica's server.
+    """
+    replica_samplers = samplers if samplers and isinstance(samplers[0], list) else [samplers]
+    servers = [_FakeServer(workers, events) for workers in replica_samplers]
 
     async def abort_replicas():
         events.append("abort")
@@ -340,11 +346,14 @@ def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, *
         backend="raiden",
         config=SimpleNamespace(engine_kwargs={"raiden": raiden_kwargs}),
         actor_wg=_FakeActorWorkerGroup(engines, weights_for_rank, events),
-        replicas=[SimpleNamespace(server_handle=_FakeActorHandle(server), world_size=len(samplers))] * num_replicas,
+        replicas=[
+            SimpleNamespace(server_handle=_FakeActorHandle(server), world_size=len(server.workers))
+            for server in servers
+        ],
         abort_replicas=abort_replicas,
         resume_generation_replicas=resume_generation_replicas,
     )
-    return manager, server
+    return manager, servers[0]
 
 
 def _trainer_engine(rank, **engine_kwargs):
@@ -476,9 +485,42 @@ def test_engine_kwargs(monkeypatch):
     # Command-line overrides may arrive as strings.
     engine = raiden.RaidenCheckpointEngine(parallelism="4", verify_parity="true", tie_word_embeddings="1")
     assert (engine.parallelism, engine.verify_parity, engine.tie_word_embeddings) == (4, True, True)
+    # The trainer only posts norms for the norm check; "exact" alone runs on the rollout workers.
+    assert raiden.RaidenCheckpointEngine(verify_parity="exact").verify_parity is False
+    assert raiden.RaidenCheckpointEngine(verify_parity="all").verify_parity is True
 
     with pytest.raises(NotImplementedError):
         engine.receive_weights()
+
+
+@pytest.mark.parametrize(
+    "value, mode",
+    [
+        (None, "off"),
+        (False, "off"),
+        ("0", "off"),
+        ("false", "off"),
+        ("off", "off"),
+        (True, "norm"),
+        ("True", "norm"),
+        ("norm", "norm"),
+        ("exact", "exact"),
+        ("ALL", "all"),
+    ],
+)
+def test_parity_check_modes(value, mode):
+    parity = raiden.RaidenParityCheck(value)
+    assert parity.mode == mode
+    assert (parity.norm, parity.exact) == (mode in ("norm", "all"), mode in ("exact", "all"))
+    # The exact check only runs on the step-0 sync of a fresh run, where vLLM still holds the checkpoint.
+    assert parity.exact_install_kwargs(0) == ({"exact_parity": True} if parity.exact else {})
+    assert parity.exact_install_kwargs(None) == parity.exact_install_kwargs(0)
+    assert parity.exact_install_kwargs(1) == {}
+
+
+def test_parity_check_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="verify_parity must be a bool or one of"):
+        raiden.RaidenParityCheck("bitwise")
 
 
 def test_registry_state_raiden_fields():
@@ -816,7 +858,12 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert transfer["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
     assert transfer["dst_units"] == [RaidenId("sampler", str(r), "weights") for r in range(tp)]
     assert (transfer["parallelism"], transfer["req_id"], transfer["dst_mem_type"]) == (4, "verl_step_0", "DRAM")
-    assert [sampler._raiden_ws.listener_port for sampler in samplers] == [12000, 12001]
+    # The control listener port is OS-assigned (0 requested) and registered with the controller.
+    listener_ports = [sampler._raiden_ws.listener_port for sampler in samplers]
+    assert len(set(listener_ports)) == tp and all(port > 0 for port in listener_ports)
+    for rank, port in enumerate(listener_ports):
+        registration = fake_tpu_sync.registrations[RaidenId("sampler", str(rank), "weights")]
+        assert registration.listener_address == f"10.0.0.1:{port}"
     assert [sampler._raiden_ws.parallelism for sampler in samplers] == [4, 4]
     assert ("lm_head.weight" in fake_tpu_sync.registry_state.get_global_shapes()) is not tie_word_embeddings
     # Released after the transfer: the send tensors are unbound, the synchronizers are kept for the next sync.
@@ -891,16 +938,129 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, tpu_raiden, caplog):
 
     samplers[1]._raiden_staging["model.embed_tokens.weight"].zero_()
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
-        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+        asyncio.run(raiden.RaidenParityCheck("norm").verify_replicas(manager, global_steps=1))
     assert "RAIDEN PARITY MISMATCH | Step 1" in caplog.text
     assert "model.embed_tokens.weight" in caplog.text
 
 
-def test_update_raiden_weights_requires_single_replica(fake_tpu_sync):
-    manager, _ = _make_manager([], lambda rank: iter(()), [], [], num_replicas=2)
-    with pytest.raises(NotImplementedError, match="single rollout replica"):
+def test_update_raiden_weights_with_two_replicas(fake_tpu_sync, tpu_raiden, caplog):
+    """Two TP=2 replicas: each registers under its own job name, gets its own transfer and parity check."""
+    tp, trainer_ranks, num_replicas = 2, 2, 2
+    weights = _trainer_weights()
+    models = [[_FakeVllmModel(tp) for _ in range(tp)] for _ in range(num_replicas)]
+    samplers = [
+        [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(replica_models)]
+        for replica_models in models
+    ]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=True) for rank in range(trainer_ranks)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        events,
+        verify_parity=True,
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        metrics = asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+
+    assert set(metrics) == TIMING_KEYS
+    assert events.count("init_raiden_sync_on_worker") == num_replicas
+    assert events.count("install_raiden_weights") == num_replicas
+    assert events.count("get_model_weights_stats") == num_replicas
+    for replica_models in models:
+        for rank, model in enumerate(replica_models):
+            _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    # Ranks 0..TP-1 of each replica are distinct units on the controller.
+    sampler_units = [unit for unit in fake_tpu_sync.registrations if unit.job_name != "trainer"]
+    assert sorted(sampler_units) == sorted(
+        RaidenId(f"sampler{replica}", str(rank), "weights") for replica in range(num_replicas) for rank in range(tp)
+    )
+    # One transfer per replica, each with the single-replica destination mesh.
+    assert [(t["req_id"], t["dst_units"]) for t in fake_tpu_sync.transfers] == [
+        (f"verl_step_1_replica{replica}", [RaidenId(f"sampler{replica}", str(rank), "weights") for rank in range(tp)])
+        for replica in range(num_replicas)
+    ]
+    assert all(
+        t["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
+        for t in fake_tpu_sync.transfers
+    )
+    # Each replica is compared with the trainer on its own.
+    for replica in range(num_replicas):
+        assert f"checking rollout replica {replica}" in caplog.text
+        assert f"RAIDEN PARITY VERIFIED | Step 1 replica {replica}" in caplog.text
+    assert "MISMATCH" not in caplog.text
+
+
+def _loaded_samplers(tpu_raiden, weights, tp):
+    """TP workers whose vLLM models already hold ``weights``, like a fresh run right after loading the checkpoint."""
+    samplers = []
+    for rank in range(tp):
+        model = _FakeVllmModel(tp)
+        model.load_state_dict(_expected_vllm_state(weights, rank, tp))
+        samplers.append(_make_sampler(tpu_raiden, rank, tp, model))
+    return samplers
+
+
+def test_exact_parity_passes_when_vllm_holds_the_checkpoint(fake_tpu_sync, tpu_raiden, caplog):
+    tp = 2
+    weights = _trainer_weights()
+    samplers = _loaded_samplers(tpu_raiden, weights, tp)
+    manager, server = _make_manager(
+        [_trainer_engine(rank, verify_parity="all") for rank in range(2)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        [],
+        verify_parity="all",
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        asyncio.run(raiden.update_raiden_weights(manager, global_steps=0))
+
+    results = [
+        res["exact_parity"] for res in server.collective_rpc("install_raiden_weights", kwargs={"exact_parity": True})
+    ]
+    # 9 vLLM parameters per rank: embed, 2 fused + 2 row-parallel projections, 3 norms, lm_head.
+    assert [(r["rank"], r["checked"], r["num_mismatched"], r["unresolved"]) for r in results] == [
+        (0, 9, 0, []),
+        (1, 9, 0, []),
+    ]
+    assert "[RAIDEN PARITY EXACT | Step 0] 2 sampler ranks, [9] tensors checked per rank, 0 mismatched" in caplog.text
+    assert "matches the checkpoint bit for bit" in caplog.text
+    assert "exact_parity" not in server.collective_rpc("install_raiden_weights")[0]  # not requested: no check
+
+
+def test_exact_parity_reports_mismatched_tensors(fake_tpu_sync, tpu_raiden, caplog):
+    tp = 2
+    weights = _trainer_weights()
+    samplers = _loaded_samplers(tpu_raiden, weights, tp)
+    # Rank 1's vLLM copy of o_proj differs from what the trainer sends: that tensor, and only that one, must be
+    # reported, for that rank only.
+    samplers[1].model_runner.model.model.layers[0].self_attn.o_proj.weight.zero_()
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        events,
+        verify_parity="exact",
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        asyncio.run(raiden.update_raiden_weights(manager, global_steps=0))
+
+    assert "[RAIDEN PARITY EXACT | Step 0] 2 sampler ranks, [9] tensors checked per rank, 1 mismatched" in caplog.text
+    assert f"  * rank 1: {LAYER}self_attn.o_proj.weight: max|diff|=" in caplog.text
+    assert "  * rank 0:" not in caplog.text
+    assert "get_model_weights_stats" not in events  # mode "exact" does not run the norm check
+    # The step-1 sync carries trained weights: no exact check there.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
         asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
-    assert fake_tpu_sync.servers_started == 0
+    assert "RAIDEN PARITY EXACT" not in caplog.text
+
+
+def test_exact_parity_warns_without_worker_results(caplog):
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        assert raiden.RaidenParityCheck.report_exact(0, [None, [{"total": 0.1}]]) is False
+    assert "[RAIDEN PARITY EXACT | Step 0] no sampler returned a result" in caplog.text
 
 
 def test_wait_for_registration_times_out():
@@ -952,23 +1112,32 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
         }
     )
     sampler = _make_sampler(tpu_raiden, rank=1, tp=2, model=_FakeVllmModel(2))
-    assert sampler.init_raiden_sync_on_worker(parallelism=4) is True
+    assert sampler.init_raiden_sync_on_worker(parallelism=4, job_name="sampler3") is True
 
     (ws,) = fake_tpu_sync.synchronizers
-    assert (ws.listener_port, ws.parallelism, ws.bind_ip) == (12001, 4, "10.0.0.1")
+    # Listener port requested as 0 (OS-assigned), never a fixed base + rank.
+    assert (ws.requested_listener_port, ws.parallelism, ws.bind_ip) == (0, 4, "10.0.0.1") and ws.listener_port > 0
     assert [tuple(t.shape) for t in ws.tensors] == [(8, 64), (128, 128), (128,)]
     assert all(t.dtype == torch.bfloat16 for t in ws.tensors)
     assert ws.skip_tiling == [False, True, False]  # only (8, 128)-tile aligned 2-D shards skip the tiling pass
-    registration = fake_tpu_sync.registrations[RaidenId("sampler", "1", "weights")]
+    registration = fake_tpu_sync.registrations[RaidenId("sampler3", "1", "weights")]
     assert registration.address == "10.0.0.2:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 2], ["fsdp", "tp"])
     assert registration.data_addresses == [f"10.0.0.1:{ws.local_port}"]
-    assert registration.listener_address == "10.0.0.1:12001"
+    assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
     assert [(v.name, v.shape, v.mesh_shape, v.sharding_spec) for v in registration.variables] == [
         (LAYER + "self_attn.k_proj.weight", [16, 64], [2, 1], ["tp", ""]),
         (LAYER + "self_attn.o_proj.weight", [128, 256], [1, 2], ["", "tp"]),
         ("model.norm.weight", [128], [1], [""]),
     ]
+    # Sharded tensors are held once per slice; the unsharded norm is held by both TP ranks.
+    stats = sampler.get_model_weights_stats()
+    assert stats["rank"] == 1
+    assert {name: entry["replicas"] for name, entry in stats["per_tensor"].items()} == {
+        LAYER + "self_attn.k_proj.weight": 1,
+        LAYER + "self_attn.o_proj.weight": 1,
+        "model.norm.weight": 2,
+    }
 
     # Later syncs reuse the receive buffers and the registration.
     assert sampler.init_raiden_sync_on_worker(parallelism=4) is True

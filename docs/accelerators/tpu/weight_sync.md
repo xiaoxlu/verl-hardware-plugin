@@ -23,11 +23,15 @@ for this backend):
    new tensors to the existing synchronizer, as long as the tensor names, shapes and dtypes do not change. The
    trainer also publishes the full shape of every tensor in the `RayWeightRegistry` actor.
 3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
-   and registers them.
-4. The controller moves the weights from the trainer hosts to the rollout hosts.
+   and registers them. With several rollout replicas (`rollout.tensor_model_parallel_size` smaller than the
+   number of rollout chips), each replica registers under its own job name, `sampler0`, `sampler1`, ...
+4. The controller moves the weights from the trainer hosts to the rollout hosts: one transfer per rollout
+   replica, issued together.
 5. The trainer unbinds its send buffers, returning their HBM to training, and keeps the synchronizer (its
    pinned host buffers and controller registration) for the next sync. Meanwhile, each rollout worker copies
-   the weights to HBM and fuses q/k/v and gate/up into vLLM's parameters.
+   the weights to HBM and fuses q/k/v and gate/up into vLLM's parameters. With `verify_parity=exact` or
+   `all`, on the step-0 sync it first compares every received tensor bit for bit with the parameter it is
+   about to overwrite (see below).
 6. Generation resumes, tagged with the new weight version.
 
 ## Requirements
@@ -43,7 +47,8 @@ for this backend):
     model.
 - Network connectivity between the hosts:
   - from all trainer and rollout hosts to the Raiden controller, which runs in the driver process;
-  - from the trainer hosts to the rollout hosts. Rollout worker `k` listens on port `12000 + k`.
+  - from the trainer hosts to the rollout hosts. Every rollout worker listens on a port the OS assigns, which
+    it registers with the controller.
 
 ## Configuration
 
@@ -51,14 +56,14 @@ for this backend):
 actor_rollout_ref.rollout.checkpoint_engine.backend=raiden
 # Optional, see the table below:
 +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.parallelism=8
-+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=True
++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=all
 +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.release_buffers_after_sync=True
 ```
 
 | Option (`engine_kwargs.raiden.*`) | Default | Description |
 |-----------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
-| `verify_parity` | `False` | After every sync, compare weight norms between trainer and rollout and log the result. Adds a pass over all weights on both sides, so it is meant for bring-up. |
+| `verify_parity` | `off` | Checks for bring-up, see [Verify](#verify). `norm` (or `True`): after every sync from step 1, compare per-tensor weight norms between trainer and rollout and log the result; adds a pass over all weights on both sides. `exact`: on the step-0 sync of a fresh run, every rollout worker compares each received tensor bit for bit with the vLLM parameter it overwrites, which still holds the checkpoint; catches a wrong shard slice, tiling or fusion that keeps the norms unchanged. `all`: both. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The environment variable `VERL_RAIDEN_RELEASE_BUFFERS` overrides the option on the trainer workers. |
 
 ## Metrics
@@ -105,13 +110,25 @@ Qwen3-0.6B run with one v6e-8 slice for training and one for rollout:
 ```
 
 The first sync (step 0) is slower, because the rollout workers allocate and register their receive
-buffers then. With `verify_parity=True`, every sync after the first also logs
+buffers then. With `verify_parity=norm` (or `True`), every sync after the first also logs
 
 ```text
 [RAIDEN PARITY VERIFIED | Step 1] 100% DISTRIBUTED NORM PARITY CONFIRMED!
 ```
 
-Both lines come from the driver process. There, vLLM's serving code imports
+once per rollout replica: with several replicas, `[RAIDEN PARITY] step 1: checking rollout replica K`
+precedes each `PARITY VERIFIED | Step 1 replica K` line. With `verify_parity=exact` (or `all`), the step-0
+sync logs
+
+```text
+[RAIDEN PARITY EXACT | Step 0] <ranks> sampler ranks, [<tensors>] tensors checked per rank, 0 mismatched, 0 unresolved: every received tensor matches the checkpoint bit for bit
+```
+
+or, on a mismatch, an error listing the differing tensors per rank. The exact check needs the trainer's
+step-0 weights to equal the checkpoint vLLM loaded, so it is skipped when resuming from a checkpoint
+(`global_steps > 0` on the first sync).
+
+These lines come from the driver process. There, vLLM's serving code imports
 `model_hosting_container_standards`, which sets Python's root logger to `SAGEMAKER_CONTAINER_LOG_LEVEL`
 (default `ERROR`). Without the variable, the driver drops the plugin's `INFO` and `WARNING` messages.
 Errors, such as a parity mismatch, are always logged.
