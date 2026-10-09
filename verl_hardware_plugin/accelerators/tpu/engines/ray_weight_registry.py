@@ -13,6 +13,7 @@ every tensor it sends (the rollout workers size their receive buffers from it), 
 weight statistics for the optional parity check.
 """
 
+import time
 from typing import Any
 
 import ray
@@ -88,6 +89,21 @@ class RayWeightRegistryState:
 
 RayWeightRegistry = ray.remote(num_cpus=0)(RayWeightRegistryState)
 
+# How long reset_ray_weight_registry waits for a killed actor's name to become free again.
+_RESET_TIMEOUT_S = 30.0
+_RESET_POLL_S = 0.2
+
+
+def _create_ray_weight_registry() -> Any:
+    # A plain scheduling strategy: created from inside a placement-group task (a vLLM worker) the actor would
+    # otherwise be captured by that group and die with it.
+    return RayWeightRegistry.options(
+        name=RAY_WEIGHT_REGISTRY_ACTOR_NAME,
+        namespace=RAY_WEIGHT_REGISTRY_NAMESPACE,
+        lifetime="detached",
+        scheduling_strategy="DEFAULT",
+    ).remote()
+
 
 def get_ray_weight_registry() -> Any:
     """Returns the detached ``RayWeightRegistry`` actor handle, creating the actor on first use."""
@@ -96,11 +112,32 @@ def get_ray_weight_registry() -> Any:
     except ValueError:
         pass
     try:
-        return RayWeightRegistry.options(
-            name=RAY_WEIGHT_REGISTRY_ACTOR_NAME,
-            namespace=RAY_WEIGHT_REGISTRY_NAMESPACE,
-            lifetime="detached",
-        ).remote()
+        return _create_ray_weight_registry()
     except Exception:
         # Another process created the actor between the lookup and the creation.
         return ray.get_actor(RAY_WEIGHT_REGISTRY_ACTOR_NAME, namespace=RAY_WEIGHT_REGISTRY_NAMESPACE)
+
+
+def reset_ray_weight_registry() -> Any:
+    """Replaces any ``RayWeightRegistry`` left behind by a previous job with a fresh actor and returns its handle.
+
+    The actor is detached, so it outlives the job that created it and keeps running that job's code. A later job
+    with a newer plugin then calls methods the old actor does not have, which kills the actor mid-flight and with
+    it every rendezvous that goes through it. Call this once per job from the driver, before anything else looks
+    the actor up.
+    """
+    try:
+        stale = ray.get_actor(RAY_WEIGHT_REGISTRY_ACTOR_NAME, namespace=RAY_WEIGHT_REGISTRY_NAMESPACE)
+    except ValueError:
+        stale = None
+    if stale is not None:
+        ray.kill(stale, no_restart=True)
+    deadline = time.monotonic() + _RESET_TIMEOUT_S
+    while True:
+        try:
+            return _create_ray_weight_registry()
+        except ValueError:
+            # The killed actor's name is released asynchronously.
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_RESET_POLL_S)

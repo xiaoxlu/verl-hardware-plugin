@@ -542,6 +542,7 @@ def fake_tpu_sync(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(raiden, "RAIDEN_DEVICE", "cpu")
     monkeypatch.setattr(raiden, "get_ray_weight_registry", lambda: world.registry)
+    monkeypatch.setattr(raiden, "reset_ray_weight_registry", lambda: world.registry)
     monkeypatch.setattr("ray.util.get_node_ip_address", lambda: "10.0.0.1")
     monkeypatch.setattr(ray, "get", _fake_ray_get)
     monkeypatch.delenv("RANK", raising=False)
@@ -639,12 +640,69 @@ def test_get_ray_weight_registry_finds_creates_or_loses_race(monkeypatch):
 
     lookups[:] = [ValueError("Failed to look up actor")]
     assert ray_weight_registry.get_ray_weight_registry() is created
-    assert options_calls == [{"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached"}]
+    assert options_calls == [
+        {"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached", "scheduling_strategy": "DEFAULT"}
+    ]
 
     # Another process creates the actor between the lookup and the creation.
     lookups[:] = [ValueError("Failed to look up actor"), existing]
     create_error[:] = [ValueError("Actor name is already taken")]
     assert ray_weight_registry.get_ray_weight_registry() is existing
+
+
+def test_reset_ray_weight_registry_replaces_stale_actor(monkeypatch):
+    """The driver kills the registry a previous job left behind (it runs that job's code) and creates a new one,
+    retrying while Ray releases the killed actor's name."""
+    stale, created = object(), object()
+    lookups: list = [stale]
+    killed = []
+    create_errors: list = [ValueError("Actor name is already taken"), ValueError("Actor name is already taken")]
+    options_calls = []
+
+    def get_actor(name, namespace=None):
+        assert (name, namespace) == ("RayWeightRegistry", "verl")
+        result = lookups.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def options(**kwargs):
+        options_calls.append(kwargs)
+
+        def remote():
+            if create_errors:
+                raise create_errors.pop(0)
+            return created
+
+        return SimpleNamespace(remote=remote)
+
+    monkeypatch.setattr(ray, "get_actor", get_actor)
+    monkeypatch.setattr(ray, "kill", lambda actor, no_restart=False: killed.append((actor, no_restart)))
+    monkeypatch.setattr(ray_weight_registry, "RayWeightRegistry", SimpleNamespace(options=options))
+    monkeypatch.setattr(ray_weight_registry, "_RESET_POLL_S", 0.0)
+
+    assert ray_weight_registry.reset_ray_weight_registry() is created
+    assert killed == [(stale, True)]
+    assert len(options_calls) == 3  # two retries while the name was still taken
+    assert options_calls[0] == {
+        "name": "RayWeightRegistry",
+        "namespace": "verl",
+        "lifetime": "detached",
+        "scheduling_strategy": "DEFAULT",  # never captured by the caller's placement group
+    }
+
+    # Nothing to kill when no actor exists.
+    lookups[:] = [ValueError("Failed to look up actor")]
+    killed.clear()
+    assert ray_weight_registry.reset_ray_weight_registry() is created
+    assert killed == []
+
+    # Gives up when the name never frees up.
+    lookups[:] = [stale]
+    create_errors[:] = [ValueError("Actor name is already taken")] * 1000
+    monkeypatch.setattr(ray_weight_registry, "_RESET_TIMEOUT_S", 0.0)
+    with pytest.raises(ValueError, match="already taken"):
+        ray_weight_registry.reset_ray_weight_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -803,7 +861,7 @@ def test_setup_raiden_controller_wraps_registry_errors(fake_tpu_sync, monkeypatc
         raise ValueError("registry unavailable")
 
     broken = _FakeActorHandle(SimpleNamespace(set_controller_address=fail))
-    monkeypatch.setattr(raiden, "get_ray_weight_registry", lambda: broken)
+    monkeypatch.setattr(raiden, "reset_ray_weight_registry", lambda: broken)
     with pytest.raises(RuntimeError, match=r"Failed to store RaidenController address \(10\.0\.0\.1:7777\)") as err:
         raiden.setup_raiden_controller()
     assert isinstance(err.value.__cause__, ValueError)

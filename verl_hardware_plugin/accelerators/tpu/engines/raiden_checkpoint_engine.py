@@ -41,7 +41,10 @@ import ray
 import torch
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
-from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
+from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import (
+    get_ray_weight_registry,
+    reset_ray_weight_registry,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -237,7 +240,8 @@ def setup_raiden_controller() -> tuple[Any, Any, str]:
     logger.info(f"RaidenControllerServer started on the driver: {address}")
 
     try:
-        registry = get_ray_weight_registry()
+        # A fresh registry for this job: a detached actor left by a previous job runs that job's plugin code.
+        registry = reset_ray_weight_registry()
         ray.get(registry.set_controller_address.remote(address))
         logger.info(f"Stored the RaidenController address ({address}) in RayWeightRegistry")
     except Exception as reg_err:
