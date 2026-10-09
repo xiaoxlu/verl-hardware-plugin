@@ -58,13 +58,24 @@ class RayWeightRegistryState:
         return self.global_shapes
 
     def set_stats(self, step: int, stats: dict[str, Any]) -> None:
-        """Records trainer rank 0's weight statistics for ``step``, keeping only the latest steps."""
+        """Records trainer rank 0's weight statistics for ``step`` (full weights on every rank)."""
         self.stats[step] = {"master": stats}
+        self._prune_stats()
+
+    def set_rank_stats(self, step: int, rank: int, stats: dict[str, Any]) -> None:
+        """Records one trainer rank's statistics of the shards it sent for ``step``.
+
+        The driver merges the ``"ranks"`` entries (``merge_rank_stats``) once every rank has posted.
+        """
+        self.stats.setdefault(step, {}).setdefault("ranks", {})[rank] = stats
+        self._prune_stats()
+
+    def _prune_stats(self) -> None:
         for old_step in sorted(self.stats)[: -self.MAX_STATS_STEPS]:
             del self.stats[old_step]
 
     def get_stats(self, step: int) -> dict[str, Any] | None:
-        """Returns ``{"master": stats}`` for ``step``, or ``None``."""
+        """Returns ``{"master": stats}`` or ``{"ranks": {rank: stats}}`` for ``step``, or ``None``."""
         return self.stats.get(step)
 
     def clear(self) -> None:

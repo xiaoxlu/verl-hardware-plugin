@@ -18,7 +18,6 @@ import sys
 import threading
 from collections import namedtuple
 from types import ModuleType, SimpleNamespace
-from unittest import mock
 
 import pytest
 import ray
@@ -146,16 +145,37 @@ class _FakeTpuSync:
         return next(ws for ws in reversed(self.synchronizers) if ws.local_port == port)
 
     def transfer(self, src_units, dst_units):
-        """Copies the trainer units' tensors into the rollout units' buffers, resharded per their metadata."""
+        """Copies the trainer units' tensors into the rollout units' buffers, resharded per their metadata.
+
+        A trainer variable is either full on every unit (``mesh_shape == [1, ...]``) or an even dim-0 shard
+        (``sharding_spec[0] == "fsdp"``, block ``global_shard_indices[0]`` of ``mesh_shape[0]``); the shards of
+        all units are assembled into the full tensor first.
+        """
         full = {}
+        shards: dict[str, dict[int, torch.Tensor]] = {}
         for unit in src_units:
             registration = self.registrations[unit]
             ws = self.synchronizer_at(registration.data_addresses[0])
             for var, tensor in zip(registration.variables, ws.tensors, strict=True):
-                # Every trainer rank registers the full, unsharded tensor.
-                assert var.mesh_shape == [1] * len(var.shape) and var.sharding_spec == [""] * len(var.shape), var.name
-                assert list(tensor.shape) == list(var.shape), var.name
-                full[var.name] = tensor
+                if var.sharding_spec[0] == "fsdp":
+                    num_shards = var.mesh_shape[0]
+                    assert var.mesh_shape == [num_shards] + [1] * (len(var.shape) - 1), var.name
+                    assert var.sharding_spec == ["fsdp"] + [""] * (len(var.shape) - 1), var.name
+                    assert list(tensor.shape) == [var.shape[0] // num_shards, *var.shape[1:]], var.name
+                    (shard_index,) = var.global_shard_indices
+                    shards.setdefault(var.name, {})[shard_index] = tensor
+                    assert registration.mesh_shape[0] == num_shards, var.name
+                else:
+                    assert var.mesh_shape == [1] * len(var.shape) and var.sharding_spec == [""] * len(var.shape), (
+                        var.name
+                    )
+                    assert list(tensor.shape) == list(var.shape), var.name
+                    if var.name in full:
+                        assert torch.equal(full[var.name], tensor), f"{var.name} differs across trainer ranks"
+                    full[var.name] = tensor
+        for name, blocks in shards.items():
+            assert sorted(blocks) == list(range(len(blocks))), f"{name}: shards {sorted(blocks)}"
+            full[name] = torch.cat([blocks[i] for i in range(len(blocks))], dim=0)
         for unit in dst_units:
             registration = self.registrations[unit]
             ws = self.synchronizer_at(registration.data_addresses[0])
@@ -351,6 +371,90 @@ def _trainer_engine(rank, **engine_kwargs):
     engine = raiden.RaidenCheckpointEngine(is_master=rank == 0, **engine_kwargs)
     engine.rank = rank
     return engine
+
+
+def _shard0_block(full_dim0, world, rank):
+    """``(offset, rows)`` of rank ``rank``'s dim-0 block under FSDP2 ``Shard(0)`` (padded chunks: the remainder
+    goes to the leading ranks)."""
+    rows = -(-full_dim0 // world)
+    offset = min(rank * rows, full_dim0)
+    return offset, max(0, min(rows, full_dim0 - offset))
+
+
+class _FakeMesh:
+    """A 1-D device mesh of ``world`` ranks seen from ``rank``. The fake builds one per tensor and keeps the full
+    tensor on it, which stands in for the DTensor all-gather in ``export_local_shards``' fallback."""
+
+    ndim = 1
+
+    def __init__(self, world, rank, full):
+        self.world, self.rank, self.full = world, rank, full
+
+    def size(self, dim=0):
+        return self.world
+
+    def get_coordinate(self):
+        return [self.rank]
+
+    def full_tensor_of(self, local):
+        offset, rows = _shard0_block(self.full.shape[0], self.world, self.rank)
+        assert torch.equal(local, self.full[offset : offset + rows]), "local is not this rank's Shard(0) block"
+        return self.full
+
+
+class _FakeTrainingEngine:
+    """Rank ``rank`` of an FSDP-``world`` trainer, like verl's torchtitan engine seen through
+    ``get_per_tensor_param_shard``: every weight with a first dim > 1 is ``Shard(0)`` across the ranks (flat bf16
+    local block + ``ShardSpec``), 1-D norms are replicated (``mesh=None``)."""
+
+    def __init__(self, weights, rank, world, replicated=("norm.weight",)):
+        self.weights, self.rank, self.world, self.replicated = weights, rank, world, replicated
+
+    def get_per_tensor_param_shard(self):
+        from torch.distributed.tensor import Shard
+
+        from verl.workers.engine.spec import ShardSpec
+
+        def gen():
+            for name, full in self.weights.items():
+                if any(name.endswith(suffix) for suffix in self.replicated):
+                    yield name, full.reshape(-1), ShardSpec(full_shape=tuple(full.shape))
+                    continue
+                offset, rows = _shard0_block(full.shape[0], self.world, self.rank)
+                local = full[offset : offset + rows].contiguous().reshape(-1)
+                mesh = _FakeMesh(self.world, self.rank, full)
+                yield name, local, ShardSpec(full_shape=tuple(full.shape), mesh=mesh, placements=(Shard(0),))
+
+        return gen(), None
+
+
+def _fake_derive_dtensor_placement(spec):
+    """Stands in for verl's ``derive_dtensor_placement`` on a ``_FakeMesh`` (the real one needs a live process
+    group); returns the Shard(0) block of the calling rank."""
+    from verl.workers.engine.spec import BlockPlacement
+
+    if spec.mesh is None:
+        return 0, True, None
+    full = tuple(int(d) for d in spec.full_shape)
+    offset, rows = _shard0_block(full[0], spec.mesh.size(0), spec.mesh.get_coordinate()[0])
+    return BlockPlacement((rows, *full[1:]), (offset,) + (0,) * (len(full) - 1), full), True, None
+
+
+@pytest.fixture
+def fsdp_export(monkeypatch):
+    """Runs ``export_local_shards`` against ``_FakeTrainingEngine``: fake placement math and DTensor all-gather."""
+    import torch.distributed.tensor as dtensor
+
+    import verl.workers.engine.spec as spec_mod
+
+    monkeypatch.setattr(spec_mod, "derive_dtensor_placement", _fake_derive_dtensor_placement)
+    monkeypatch.setattr(
+        dtensor.DTensor,
+        "from_local",
+        staticmethod(
+            lambda local, mesh, placements, **kw: SimpleNamespace(full_tensor=lambda: mesh.full_tensor_of(local))
+        ),
+    )
 
 
 class _Linear(nn.Module):
@@ -567,21 +671,75 @@ def test_as_bool(value, expected):
     assert raiden._as_bool(value) is expected
 
 
-def test_tile_alignment_and_skip_tiling_api():
-    assert raiden.raiden_is_tile_aligned([8, 128])
-    assert raiden.raiden_is_tile_aligned([2, 16, 256])
-    assert not raiden.raiden_is_tile_aligned([4, 128])
-    assert not raiden.raiden_is_tile_aligned([8, 64])
-    assert not raiden.raiden_is_tile_aligned([1024])
+def test_export_local_shards_even_dim0_cut(fsdp_export):
+    weights = _trainer_weights()
+    for rank in range(2):
+        named, shard_info = raiden.export_local_shards(_FakeTrainingEngine(weights, rank, world=2))
+        exported = dict(named)
+        assert set(exported) == set(weights)
+        for name, full in weights.items():
+            if name.endswith("norm.weight"):
+                assert name not in shard_info and torch.equal(exported[name], full)  # replicated: full on every rank
+            else:
+                assert shard_info[name] == (2, rank)
+                assert torch.equal(exported[name], full.chunk(2, dim=0)[rank])  # local block, un-flattened
 
-    # The setter's name differs across tpu_sync builds; builds with neither are left alone.
-    test_only_api = SimpleNamespace(test_only_set_skip_tiling=mock.Mock())
-    public_api = SimpleNamespace(set_skip_tiling=mock.Mock())
-    raiden.apply_raiden_skip_tiling(test_only_api, [True])
-    raiden.apply_raiden_skip_tiling(public_api, [False])
-    raiden.apply_raiden_skip_tiling(SimpleNamespace(), [True])
-    test_only_api.test_only_set_skip_tiling.assert_called_once_with([True])
-    public_api.set_skip_tiling.assert_called_once_with([False])
+
+def test_export_local_shards_falls_back_to_all_gather(fsdp_export):
+    """Layouts Raiden cannot describe (here an uneven dim-0 cut: 3 ranks) are all-gathered on every rank."""
+    weights = _trainer_weights()
+    for rank in range(3):
+        named, shard_info = raiden.export_local_shards(_FakeTrainingEngine(weights, rank, world=3))
+        exported = dict(named)
+        assert shard_info == {}
+        assert all(torch.equal(exported[name], full) for name, full in weights.items())
+
+
+def test_export_local_shards_rejects_exporter_defined_placements(fsdp_export):
+    from verl.workers.engine.spec import ShardSpec
+
+    engine = SimpleNamespace(
+        get_per_tensor_param_shard=lambda: (
+            iter([("w", torch.zeros(4), ShardSpec(full_shape=(8,), hf_slots=[("w", (8,))]))]),
+            None,
+        )
+    )
+    with pytest.raises(NotImplementedError, match="expert stacks"):
+        raiden.export_local_shards(engine)
+
+
+def test_merge_rank_stats_matches_full_model_stats():
+    """Per-rank shard stats (full tensors on rank 0 only) sum to the stats of the full weights."""
+    weights = _trainer_weights()
+    full = raiden.compute_tensor_stats(list(weights.items()))
+    rank_stats = {}
+    for rank in range(2):
+        items = []
+        for name, tensor in weights.items():
+            if name.endswith("norm.weight"):
+                if rank == 0:
+                    items.append((name, tensor))
+            else:
+                items.append((name, tensor.chunk(2, dim=0)[rank]))
+        rank_stats[rank] = raiden.compute_tensor_stats(items)
+    merged = raiden.merge_rank_stats(rank_stats)
+    assert (merged["total_numel"], merged["num_tensors"]) == (full["total_numel"], full["num_tensors"])
+    assert merged["l1_norm"] == pytest.approx(full["l1_norm"], rel=1e-6)
+    assert merged["l2_norm"] == pytest.approx(full["l2_norm"], rel=1e-6)
+    for name in weights:
+        assert merged["per_tensor"][name]["numel"] == full["per_tensor"][name]["numel"]
+        assert merged["per_tensor"][name]["l1"] == pytest.approx(full["per_tensor"][name]["l1"], rel=1e-6)
+
+
+def test_registry_rank_stats():
+    reg = RayWeightRegistryState()
+    reg.set_rank_stats(1, 1, {"per_tensor": {"a": {"l1": 1.0, "l2_sq": 1.0, "numel": 1}}})
+    assert reg.get_stats(1) == {"ranks": {1: {"per_tensor": {"a": {"l1": 1.0, "l2_sq": 1.0, "numel": 1}}}}}
+    reg.set_rank_stats(1, 0, {"per_tensor": {}})
+    assert sorted(reg.get_stats(1)["ranks"]) == [0, 1]
+    for step in range(2, 2 + RayWeightRegistryState.MAX_STATS_STEPS):
+        reg.set_rank_stats(step, 0, {})
+    assert reg.get_stats(1) is None  # pruned like set_stats entries
 
 
 def test_validate_and_sanitize_tensors():
@@ -667,7 +825,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     assert [t.data_ptr() for t in ws.tensors] == [weights[n].data_ptr() for n in names]  # bound in place
     assert (ws.parallelism, ws.bind_ip) == (8, "10.0.0.1")
     assert ws.kwargs == {"unsafe_skip_buffer_lock": True, "auto_h2d": False}
-    assert ws.d2h_calls == 1  # staged in host memory before send_weights returns
+    assert ws.d2h_calls == 0  # staged by the controller's push during the transfer, not here
     registration = fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")]
     assert registration.address == "10.0.0.1:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 1], ["fsdp", "tp"])
@@ -686,14 +844,14 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     assert fake_tpu_sync.registry_state.get_global_shapes() == {n: list(s) for n, s in TRAINER_SHAPES.items()}
 
     # After the transfer, release_sync_buffers unbinds the send tensors but keeps the synchronizer and its
-    # controller registration; the next sync rebinds the new tensors and stages them, without re-registering.
+    # controller registration; the next sync rebinds the new tensors, without re-registering.
     engine.release_sync_buffers()
     assert engine._trainer_raiden_ws is ws
     assert (ws.unbind_calls, ws.bound, engine._bound_tensors) == (1, False, None)
     new_weights = _trainer_weights(seed=1)
     asyncio.run(engine.send_weights(iter(new_weights.items()), global_steps=2))
     assert fake_tpu_sync.synchronizers == [ws]
-    assert (ws.bind_calls, ws.bound, ws.d2h_calls) == (1, True, 2)
+    assert (ws.bind_calls, ws.bound, ws.d2h_calls) == (1, True, 0)
     assert [t.data_ptr() for t in ws.tensors] == [new_weights[n].data_ptr() for n in names]
     assert fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")] is registration
 
@@ -707,7 +865,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     asyncio.run(engine.send_weights(iter(fewer.items()), global_steps=4))
     assert len(fake_tpu_sync.synchronizers) == 2
     new_ws = fake_tpu_sync.synchronizers[1]
-    assert engine._trainer_raiden_ws is new_ws and new_ws.d2h_calls == 1
+    assert engine._trainer_raiden_ws is new_ws
     registration = fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")]
     assert registration.data_addresses == [f"10.0.0.1:{new_ws.local_port}"]
     assert [var.name for var in registration.variables] == sorted(fewer)
@@ -846,11 +1004,111 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert [sampler._raiden_ws.h2d_calls for sampler in samplers] == [2, 2]
     sampler_synchronizers = [sampler._raiden_ws for sampler in samplers]
     trainer_synchronizers = [ws for ws in fake_tpu_sync.synchronizers if ws not in sampler_synchronizers]
-    assert [ws.d2h_calls for ws in trainer_synchronizers] == [2] * trainer_ranks  # one synchronizer per rank
+    assert [ws.d2h_calls for ws in trainer_synchronizers] == [0] * trainer_ranks  # one synchronizer per rank
     bind_state = [(ws.bind_calls, ws.unbind_calls, ws.bound) for ws in trainer_synchronizers]
     assert bind_state == [(1, 2, False)] * trainer_ranks  # rebound once, unbound after each transfer
     assert "RAIDEN PARITY VERIFIED | Step 1" in caplog.text
     assert "MISMATCH" not in caplog.text
+
+
+def test_update_raiden_weights_from_local_fsdp_shards(fake_tpu_sync, fsdp_export, tpu_raiden, caplog):
+    """send_weights receives the training engine: each trainer rank registers its FSDP Shard(0) block and the
+    controller reshards FSDP=2 -> TP=2 (no rank gathers the full model); the parity check merges the ranks' stats."""
+    tp = fsdp = 2
+    weights = {"current": _trainer_weights(seed=0)}
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(fsdp)]
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        engines,
+        lambda rank: _FakeTrainingEngine(weights["current"], rank, fsdp),
+        samplers,
+        [],
+        verify_parity=True,
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights["current"], rank, tp))
+    sharded = sorted(name for name in TRAINER_SHAPES if not name.endswith("norm.weight"))
+    for rank in range(fsdp):
+        registration = fake_tpu_sync.registrations[RaidenId("trainer", str(rank), "weights")]
+        assert registration.mesh_shape == [fsdp, 1]
+        ws = fake_tpu_sync.synchronizer_at(registration.data_addresses[0])
+        for var, bound in zip(registration.variables, ws.tensors, strict=True):
+            full = list(TRAINER_SHAPES[var.name])
+            assert var.shape == full  # the full shape is registered, with this rank's block index
+            if var.name in sharded:
+                assert (var.mesh_shape, var.sharding_spec, var.global_shard_indices) == (
+                    [fsdp] + [1] * (len(full) - 1),
+                    ["fsdp"] + [""] * (len(full) - 1),
+                    [rank],
+                )
+                assert list(bound.shape) == [full[0] // fsdp, *full[1:]]
+            else:
+                assert (var.mesh_shape, var.sharding_spec, list(bound.shape)) == (
+                    [1] * len(full),
+                    [""] * len(full),
+                    full,
+                )
+        assert engines[rank]._shard_info == {name: (fsdp, rank) for name in sharded}
+    assert fake_tpu_sync.registry_state.get_global_shapes() == {n: list(s) for n, s in TRAINER_SHAPES.items()}
+    # Every rank posted its shard stats; the merged stats describe the whole model once.
+    stats = fake_tpu_sync.registry_state.get_stats(1)
+    assert sorted(stats["ranks"]) == [0, 1]
+    merged = raiden.merge_rank_stats(stats["ranks"])
+    assert merged["total_numel"] == sum(t.numel() for t in weights["current"].values())
+    assert "RAIDEN PARITY VERIFIED | Step 1" in caplog.text
+    assert "MISMATCH" not in caplog.text
+
+    # Second sync: same shard layout -> rebind, no re-registration; new weights arrive resharded.
+    weights["current"] = _trainer_weights(seed=1)
+    registrations_before = dict(fake_tpu_sync.registrations)
+    asyncio.run(raiden.update_raiden_weights(manager, global_steps=2))
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights["current"], rank, tp))
+    assert fake_tpu_sync.registrations == registrations_before
+    assert all(engine._trainer_raiden_ws.bind_calls == 1 for engine in engines)
+
+
+def test_worker_hook_passes_training_engine_to_consuming_engines():
+    """ActorRolloutRefWorker.update_weights hands the training engine to engines with consumes_training_engine
+    and leaves the per-tensor path (and verl's dispatch registration) alone otherwise."""
+    from verl.single_controller.base.decorator import MAGIC_ATTR
+    from verl.workers.engine_workers import ActorRolloutRefWorker
+
+    update_weights = ActorRolloutRefWorker.update_weights
+    assert getattr(update_weights, "_verl_raiden_engine_patched", False)
+    assert getattr(update_weights, MAGIC_ATTR)["dispatch_mode"] is not None  # verl's @register attrs survive
+
+    calls = []
+
+    class _Engine:
+        consumes_training_engine = True
+
+        async def send_weights(self, weights, global_steps=None):
+            calls.append((weights, global_steps))
+            return {"timing_s/x": 1.0}
+
+    class _PlainEngine:
+        async def send_weights(self, weights, global_steps=None):
+            calls.append((list(weights), global_steps))
+
+    training_engine = SimpleNamespace(
+        get_per_tensor_param=lambda: (iter([("w", 1)]), None), get_per_tensor_param_shard=lambda: (iter(()), None)
+    )
+    worker = SimpleNamespace(
+        config=SimpleNamespace(rollout=SimpleNamespace(checkpoint_engine=SimpleNamespace(backend="raiden"))),
+        actor=SimpleNamespace(engine=training_engine),
+        checkpoint_engine=_Engine(),
+    )
+    assert asyncio.run(update_weights(worker, global_steps=3)) == {"timing_s/x": 1.0}
+    assert calls == [(training_engine, 3)]
+
+    worker.checkpoint_engine = _PlainEngine()
+    assert asyncio.run(update_weights(worker, global_steps=4, mode="other")) == {}
+    assert calls[-1] == ([("w", 1)], 4)
 
 
 def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_tpu_sync, tpu_raiden):
@@ -958,7 +1216,7 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
     assert (ws.listener_port, ws.parallelism, ws.bind_ip) == (12001, 4, "10.0.0.1")
     assert [tuple(t.shape) for t in ws.tensors] == [(8, 64), (128, 128), (128,)]
     assert all(t.dtype == torch.bfloat16 for t in ws.tensors)
-    assert ws.skip_tiling == [False, True, False]  # only (8, 128)-tile aligned 2-D shards skip the tiling pass
+    assert ws.skip_tiling is None  # left to Raiden's planner, which sees the source shards too
     registration = fake_tpu_sync.registrations[RaidenId("sampler", "1", "weights")]
     assert registration.address == "10.0.0.2:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 2], ["fsdp", "tp"])

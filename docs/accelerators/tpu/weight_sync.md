@@ -17,14 +17,18 @@ The driver runs each sync (`update_raiden_weights`, which replaces `CheckpointEn
 for this backend):
 
 1. It pauses generation. The initial sync at step 0 skips this.
-2. Every trainer rank binds the full weights, which verl gathers on every rank, to its tpu-sync
-   `WeightSynchronizer` and copies them to host memory. On the first sync it creates that synchronizer and
-   registers it with the Raiden controller, which the driver starts at the same time; later syncs rebind the
-   new tensors to the existing synchronizer, as long as the tensor names, shapes and dtypes do not change. The
-   trainer also publishes the full shape of every tensor in the `RayWeightRegistry` actor.
+2. Every trainer rank binds its local FSDP shards of the weights (taken straight from the training engine, no
+   all-gather) to its tpu-sync `WeightSynchronizer` and registers them with their position in the full tensor.
+   Tensors that FSDP does not shard (norms) and layouts Raiden cannot describe (an uneven split) are registered
+   in full. On the first sync it creates that synchronizer and registers it with the Raiden controller, which
+   the driver starts at the same time; later syncs rebind the new tensors to the existing synchronizer, as long
+   as the tensor names, shapes, dtypes and shard layout do not change. The trainer also publishes the full shape
+   of every tensor in the `RayWeightRegistry` actor.
 3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
    and registers them.
-4. The controller moves the weights from the trainer hosts to the rollout hosts.
+4. The controller moves the weights from the trainer hosts to the rollout hosts, resharding FSDP shards into
+   vLLM's tensor-parallel shards on the way; it stages the trainer's device buffers to host memory as part of
+   the transfer.
 5. The trainer unbinds its send buffers, returning their HBM to training, and keeps the synchronizer (its
    pinned host buffers and controller registration) for the next sync. Meanwhile, each rollout worker copies
    the weights to HBM and fuses q/k/v and gate/up into vLLM's parameters.
@@ -59,7 +63,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=raiden
 |-----------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `False` | After every sync, compare weight norms between trainer and rollout and log the result. Adds a pass over all weights on both sides, so it is meant for bring-up. |
-| `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The environment variable `VERL_RAIDEN_RELEASE_BUFFERS` overrides the option on the trainer workers. |
+| `release_buffers_after_sync` | `True` | Unbind the send buffers (the bf16 export of this rank's shards) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The environment variable `VERL_RAIDEN_RELEASE_BUFFERS` overrides the option on the trainer workers. |
 
 ## Metrics
 
@@ -69,7 +73,7 @@ trainer, log them with the step metrics:
 | Metric | Phase |
 |--------|-------|
 | `timing_s/tpu-sync/quiesce` | Pausing generation |
-| `timing_s/tpu-sync/trainer_init` | Trainer ranks gathering their weights, creating and registering a synchronizer, and copying the weights to host memory |
+| `timing_s/tpu-sync/trainer_init` | Trainer ranks exporting their local shards, and creating and registering a synchronizer (first sync) or rebinding the existing one |
 | `timing_s/tpu-sync/sampler_init` | Rollout workers allocating and registering their receive buffers |
 | `timing_s/tpu-sync/barrier` | Waiting until every worker has registered |
 | `timing_s/tpu-sync/p2p_transfer` | The transfer |
