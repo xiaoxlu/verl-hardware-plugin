@@ -23,8 +23,8 @@ for this backend):
    new tensors to the existing synchronizer, as long as the tensor names, shapes and dtypes do not change. The
    trainer also publishes the full shape of every tensor in the `RayWeightRegistry` actor.
 3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
-   and registers them. With several rollout replicas (`rollout.tensor_model_parallel_size` smaller than the
-   number of rollout chips), each replica registers under its own job name, `sampler0`, `sampler1`, ...
+   and registers them. With several rollout replicas (a rollout pool of several slices, one vLLM engine
+   per slice), each replica registers under its own job name, `sampler0`, `sampler1`, ...
 4. The controller moves the weights from the trainer hosts to the rollout hosts: one transfer per rollout
    replica, issued together.
 5. The trainer unbinds its send buffers, returning their HBM to training, and keeps the synchronizer (its
@@ -121,7 +121,7 @@ precedes each `PARITY VERIFIED | Step 1 replica K` line. With `verify_parity=exa
 sync logs
 
 ```text
-[RAIDEN PARITY EXACT | Step 0] <ranks> sampler ranks, [<tensors>] tensors checked per rank, 0 mismatched, 0 unresolved: every received tensor matches the checkpoint bit for bit
+[RAIDEN PARITY EXACT | Step 0] 8 sampler ranks, [227] tensors checked per rank, 0 mismatched, 0 unresolved: every received tensor matches the checkpoint bit for bit
 ```
 
 or, on a mismatch, an error listing the differing tensors per rank. The exact check needs the trainer's
