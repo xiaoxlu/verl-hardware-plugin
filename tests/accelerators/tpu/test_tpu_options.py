@@ -134,6 +134,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
         verify_parity="off",
         release_buffers_after_sync=True,
         tie_word_embeddings=None,
+        pause_after_transfer=True,
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
@@ -142,6 +143,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
             "verify_parity": "true",
             "release_buffers_after_sync": "0",
             "tie_word_embeddings": 1,
+            "pause_after_transfer": "false",
         }
     )
     assert options == TPUSyncOptions(
@@ -149,6 +151,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
         verify_parity="norm",
         release_buffers_after_sync=False,
         tie_word_embeddings=True,
+        pause_after_transfer=False,
     )
 
 

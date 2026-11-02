@@ -632,9 +632,12 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     t_sync_wall = time.time()
 
-    # 0. Pause the rollout concurrently with the trainer-side export below. The trainer only exports and binds its
-    #    own tensors and registers with the controller; nothing reads or writes rollout memory before step 2
-    #    (rollout init), so the pause need not run in front of it.
+    # 0. Pause the rollout. With pause_after_transfer (default) the rollout keeps its requests through the trainer
+    #    export, the transfer and the H2D into its HBM staging buffers, none of which touches vLLM's parameters,
+    #    and is paused only right before the install (step 5). The first sync of this driver still pauses up front:
+    #    it allocates the rollout's staging buffers. Otherwise the pause runs concurrently with the trainer-side
+    #    export below: the trainer only exports and binds its own tensors and registers with the controller, and
+    #    nothing reads or writes rollout memory before step 2 (rollout init).
     async def _quiesce_rollout() -> float:
         t0 = time.perf_counter()
         if global_steps and global_steps > 0:
@@ -644,7 +647,8 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
                 logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
         return time.perf_counter() - t0
 
-    quiesce_task = asyncio.create_task(_quiesce_rollout())
+    pause_late = options.pause_after_transfer and bool(getattr(manager, "_tpu_sync_rollout_installed", False))
+    quiesce_task = None if pause_late else asyncio.create_task(_quiesce_rollout())
 
     t_total_start = time.perf_counter()
 
@@ -656,12 +660,17 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         if actor_refs is not None:
             await asyncio.to_thread(ray.get, actor_refs)
     except BaseException:
-        quiesce_task.cancel()
+        if quiesce_task is not None:
+            quiesce_task.cancel()
         raise
     t_init_trainer = time.perf_counter() - t_init_trainer_start
 
-    # The rollout must be paused before anything below touches it.
-    t_abort = await quiesce_task
+    # Without pause_late the rollout must be paused before anything below touches it; its pause started with the
+    # sync.
+    t_abort = 0.0
+    t_paused_start = t_total_start
+    if quiesce_task is not None:
+        t_abort = await quiesce_task
 
     # 2. Every rollout worker allocates its receive buffers and registers them with the controller under
     #    its replica's job name (a no-op after the first sync).
@@ -723,11 +732,29 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     # so the HBM is back before the next training step.
     release_refs = manager.actor_wg.execute_checkpoint_engine(["release_sync_buffers"] * manager.actor_wg.world_size)
 
-    # 5. Rollout workers copy the received weights to TPU HBM and fuse them into vLLM's parameters.
+    # 4b. With pause_late, copy the received weights into the rollout's HBM staging buffers before the pause
+    #     (they are not vLLM's parameters; the engine runs the copy between its steps), then pause it for the install.
+    t_h2d_early = 0.0
+    h2d_early_results: list = []
+    install_kwargs = dict(exact_install_kwargs)
+    if pause_late:
+        t_h2d_early_start = time.perf_counter()
+        h2d_early_results = await asyncio.gather(
+            *[
+                replica.server_handle.collective_rpc.remote(method="h2d_tpu_sync_weights")
+                for replica in manager.replicas
+            ]
+        )
+        t_h2d_early = time.perf_counter() - t_h2d_early_start
+        install_kwargs["skip_h2d"] = True
+        t_paused_start = time.perf_counter()
+        t_abort = await _quiesce_rollout()
+
+    # 5. Rollout workers copy the received weights to TPU HBM (unless 4b did) and fuse them into vLLM's parameters.
     t_install_start = time.perf_counter()
     install_results = await asyncio.gather(
         *[
-            replica.server_handle.collective_rpc.remote(method="install_tpu_sync_weights", kwargs=exact_install_kwargs)
+            replica.server_handle.collective_rpc.remote(method="install_tpu_sync_weights", kwargs=install_kwargs)
             for replica in manager.replicas
         ]
     )
@@ -739,9 +766,16 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         r for per_replica in install_results for r in (per_replica or []) if isinstance(r, dict) and "h2d" in r
     ]
     t_h2d_pure = max((r["h2d"] for r in worker_install_stats), default=None)
+    if pause_late:
+        # The H2D ran in 4b; each worker returned its time from h2d_tpu_sync_weights.
+        t_h2d_pure = max(
+            (float(r) for per_replica in h2d_early_results for r in (per_replica or []) if isinstance(r, int | float)),
+            default=None,
+        )
     # Tag new generations with this weight version (the trajectory staleness metrics read it), as the other
     # checkpoint backends do once the new weights are loaded. abort_replicas() already reset the prefix
-    # cache, and no request has run since.
+    # cache, and no request has run since. Generations that finished before a late pause (pause_late) ran on
+    # the previous weights and keep the previous tag.
     t_finalize_start = time.perf_counter()
     if global_steps is not None:
         await asyncio.gather(
@@ -765,6 +799,10 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     t_resume_start = time.perf_counter()
     await manager.resume_generation_replicas()
     t_resume = time.perf_counter() - t_resume_start
+    # From the pause (abort) to the resume (0 on the step-0 sync, which does not pause it).
+    t_rollout_paused = time.perf_counter() - t_paused_start if global_steps else 0.0
+    # The rollout's staging buffers exist now, so later syncs may pause late (see step 0).
+    manager._tpu_sync_rollout_installed = True
 
     # 8. Wait for the trainer to free its send buffers before the next training step.
     t_release_start = time.perf_counter()
@@ -774,34 +812,40 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     t_total = time.perf_counter() - t_total_start
 
+    quiesce_note = "after the transfer and H2D" if pause_late else "overlaps Trainer Init"
     logger.info(
         f"[TPU-SYNC TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
-        f"  * Sampler Quiesce/Pause  : {t_abort:.4f}s (overlaps Trainer Init)\n"
+        f"  * Sampler Quiesce/Pause  : {t_abort:.4f}s ({quiesce_note})\n"
         f"  * Trainer Init           : {t_init_trainer:.4f}s\n"
         f"  * Sampler Init           : {t_init_sampler:.4f}s\n"
         f"  * Barrier Check          : {t_barrier:.4f}s\n"
         f"  * Controller P2P         : {t_transfer:.4f}s\n"
+        f"  * Sampler H2D (early)    : {t_h2d_early:.4f}s (before the pause)\n"
         f"  * Sampler H2D DMA        : {t_install:.4f}s\n"
         f"  * Parity Check           : {t_parity:.4f}s\n"
         f"  * Sampler Resume         : {t_resume:.4f}s\n"
+        f"  * Rollout Paused         : {t_rollout_paused:.4f}s\n"
         f"  * Trainer Buffer Release : {t_release:.4f}s (rollout already generating)\n"
         f"  * Total End-to-End Sync  : {t_total:.4f}s"
     )
 
     if timeline.enabled():
         step = global_steps or 0
-        # The quiesce runs concurrently with the trainer send; every later phase follows the longer of the two.
+        # Without pause_late the quiesce runs concurrently with the trainer send and every later phase follows the
+        # longer of the two; with pause_late it runs right before the install.
         sync_phases = [
             ("sync.sampler_init", t_init_sampler),
             ("sync.barrier", t_barrier),
             ("sync.p2p_transfer", t_transfer),
+            ("sync.sampler_h2d_early", t_h2d_early),
+            ("sync.quiesce", t_abort if pause_late else 0.0),
             ("sync.sampler_install", t_install),
             ("sync.finalize", t_finalize),
             ("sync.parity_check", t_parity if verify_parity or exact_install_kwargs else 0.0),
             ("sync.resume", t_resume),
             ("sync.trainer_release", t_release),
         ]
-        t_concurrent = max(t_abort, t_init_trainer)
+        t_concurrent = t_init_trainer if pause_late else max(t_abort, t_init_trainer)
         timeline.emit(
             "update_weights" if step > 0 else "initial_weight_sync",
             t_sync_wall,
@@ -811,8 +855,12 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
             trainer_send=round(t_init_trainer, 3),
             p2p=round(t_transfer, 3),
             install=round(t_install, 3),
+            rollout_paused=round(t_rollout_paused, 3),
         )
-        for phase_name, phase_dur in (("sync.quiesce", t_abort), ("sync.trainer_send", t_init_trainer)):
+        concurrent_phases = [("sync.trainer_send", t_init_trainer)]
+        if not pause_late:
+            concurrent_phases.insert(0, ("sync.quiesce", t_abort))
+        for phase_name, phase_dur in concurrent_phases:
             if phase_dur >= 1e-4:
                 timeline.emit(phase_name, t_sync_wall, phase_dur, step=step)
         t_cursor = t_sync_wall + t_concurrent
@@ -823,15 +871,18 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     # Surface the phase timers as step metrics. Trainers that record sync metrics (e.g. the separate-async
     # trainer's _pending_sync_metrics) log them next to timing_s/update_weights with every configured
-    # backend (console / tensorboard / wandb). total_sync spans the whole sync: the quiesce overlaps its trainer_init.
+    # backend (console / tensorboard / wandb). total_sync spans the whole sync: the quiesce overlaps its trainer_init
+    # (or, with pause_after_transfer, follows the H2D). rollout_paused runs from the pause (abort) to the resume.
     metrics = {
         "timing_s/tpu-sync/quiesce": t_abort,
         "timing_s/tpu-sync/trainer_init": t_init_trainer,
         "timing_s/tpu-sync/sampler_init": t_init_sampler,
         "timing_s/tpu-sync/barrier": t_barrier,
         "timing_s/tpu-sync/p2p_transfer": t_transfer,
+        "timing_s/tpu-sync/sampler_h2d_early": t_h2d_early,
         "timing_s/tpu-sync/sampler_h2d": t_install,
         "timing_s/tpu-sync/sampler_resume": t_resume,
+        "timing_s/tpu-sync/rollout_paused": t_rollout_paused,
         "timing_s/tpu-sync/trainer_release": t_release,
         "timing_s/tpu-sync/total_sync": t_total,
     }

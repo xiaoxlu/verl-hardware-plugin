@@ -329,18 +329,42 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         return True
 
     @torch.no_grad()
-    def install_tpu_sync_weights(self, exact_parity: bool = False) -> dict:
+    def h2d_tpu_sync_weights(self) -> float:
+        """Copy the received weights from the host buffers into the HBM staging buffers, without installing them.
+
+        Writes only the staging buffers, never vLLM's parameters, so the driver calls it while the rollout is
+        not paused (``pause_after_transfer``) and then installs with ``install_tpu_sync_weights(skip_h2d=True)``
+        once the rollout is paused.
+
+        Returns:
+            The H2D time in seconds (including the TPU sync that waits for it), or 0.0 if the synchronizer is not
+            initialized.
+        """
+        if getattr(self, "_tpu_sync_ws", None) is None:
+            logger.warning("tpu-sync Sampler: h2d_tpu_sync_weights called before _tpu_sync_ws was initialized.")
+            return 0.0
+        t_start = time.perf_counter()
+        # h2d() applies the skip_tiling plan the listener received with this transfer (see
+        # init_tpu_sync_on_worker); nothing must override it here.
+        self._tpu_sync_ws.h2d()
+        tpu_sync_engine.tpu_synchronize()
+        return time.perf_counter() - t_start
+
+    @torch.no_grad()
+    def install_tpu_sync_weights(self, exact_parity: bool = False, skip_h2d: bool = False) -> dict:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
         and fuse/transpose them directly into vLLM model parameters.
 
         Args:
             exact_parity: Set by the driver on the step-0 sync with ``verify_parity=exact|all``: compare every
                 received tensor bit for bit with the vLLM parameter it overwrites (``ExactParityCheck``).
+            skip_h2d: The driver already ran ``h2d_tpu_sync_weights`` for this transfer, so the HBM staging
+                buffers hold the received weights; install from them without copying from the host again.
 
         Returns:
-            Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_tpu_sync_ws.h2d()``)
-            and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's result) when requested.
-            Empty if the synchronizer is not initialized.
+            Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_tpu_sync_ws.h2d()``, 0.0 with
+            ``skip_h2d``) and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's result) when
+            requested. Empty if the synchronizer is not initialized.
         """
         if getattr(self, "_tpu_sync_ws", None) is None:
             logger.warning("tpu-sync Sampler: install_tpu_sync_weights called before _tpu_sync_ws was initialized.")
@@ -349,9 +373,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         rank = getattr(self, "rank", 0)
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
-        # h2d() applies the skip_tiling plan the listener received with this transfer (see
-        # init_tpu_sync_on_worker); nothing must override it here.
-        self._tpu_sync_ws.h2d()
+        if not skip_h2d:
+            # h2d() applies the skip_tiling plan the listener received with this transfer (see
+            # init_tpu_sync_on_worker); nothing must override it here.
+            self._tpu_sync_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
         if getattr(self, "_tpu_sync_use_vllm_loaders", False):

@@ -85,6 +85,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
+| `pause_after_transfer` | `True` | Keep the rollout's requests running (not aborted) through the trainer export, the transfer and the H2D into its HBM staging buffers, and pause it only for the install into vLLM's parameters. The engine runs the rollout init and the H2D between its steps, so generation stalls for those (about 0.15 s at 8B) but keeps its requests and KV cache. Generations that finish before the pause used the previous weights and keep their `global_steps` tag. The first sync of a run still pauses up front (it allocates the staging buffers). `False` pauses the rollout at the start of every sync. See [Metrics](#metrics). |
 
 ## Rollout install
 
@@ -153,16 +154,18 @@ trainer, log them with the step metrics:
 
 | Metric | Phase |
 |--------|-------|
-| `timing_s/tpu-sync/quiesce` | Pausing generation; runs concurrently with `trainer_init` |
+| `timing_s/tpu-sync/quiesce` | Pausing generation; runs concurrently with `trainer_init`, or with `pause_after_transfer` after `sampler_h2d_early` |
 | `timing_s/tpu-sync/trainer_init` | Trainer ranks gathering their weights, and creating and registering a synchronizer (first sync) or rebinding the existing one |
 | `timing_s/tpu-sync/sampler_init` | Rollout workers allocating and registering their receive buffers |
 | `timing_s/tpu-sync/barrier` | Waiting until every worker has registered |
 | `timing_s/tpu-sync/p2p_transfer` | The transfer |
-| `timing_s/tpu-sync/sampler_h2d` | Rollout workers copying the weights to HBM and into vLLM's parameters |
+| `timing_s/tpu-sync/sampler_h2d_early` | With `pause_after_transfer`: rollout workers copying the weights into their HBM staging buffers, before the pause; the engine runs it between steps (0 otherwise) |
+| `timing_s/tpu-sync/sampler_h2d` | Rollout workers copying the weights to HBM (unless `sampler_h2d_early` did) and into vLLM's parameters |
 | `timing_s/tpu-sync/sampler_h2d_pure` | The host-to-device copy alone, on the slowest rollout worker |
 | `timing_s/tpu-sync/sampler_resume` | Resuming generation, after the parity checks (if enabled) |
+| `timing_s/tpu-sync/rollout_paused` | From the pause (abort) to the resume |
 | `timing_s/tpu-sync/trainer_release` | Waiting for the trainer to free its send buffers; generation has already resumed |
-| `timing_s/tpu-sync/total_sync` | The whole sync, including the pause that overlaps `trainer_init` |
+| `timing_s/tpu-sync/total_sync` | The whole sync, including the pause |
 
 `sampler_h2d_pure` and the `verify_parity` checks read the rollout workers' return values, which verl's vLLM server
 passes back from `collective_rpc` (since verl-project/verl#8155). With an older verl, the sync still works, but
@@ -170,6 +173,14 @@ passes back from `collective_rpc` (since verl-project/verl#8155). With an older 
 
 Generation resumes as soon as the rollout holds the new weights and has passed the parity checks; it does not wait
 for the trainer to free its send buffers, which only gives trainer HBM back before the next training step.
+
+With `pause_after_transfer` (default) the rollout keeps its requests until the weights are in its HBM staging buffers, so
+`rollout_paused` covers only the pause, the install, the parity checks and the resume. Generation also stalls, without
+aborting, while the engine runs `sampler_init` and `sampler_h2d_early` between its steps. The trainer's sync gets longer
+instead: the pause no longer overlaps `trainer_init`, and the transfer and the H2D share the rollout hosts with
+generation. On 2 × v6e-8 (Qwen3-8B, trainer FSDP8, rollout TP8, `verify_parity=norm`, steps 2–10), `rollout_paused`
+went from 2.09 s to 0.63 s (0.46 s of it is the parity check; 0.78 s including the stalls above) and `update_weights`
+from 2.09 s to 2.35 s.
 
 ## Verify
 

@@ -57,8 +57,10 @@ TIMING_KEYS = {
         "sampler_init",
         "barrier",
         "p2p_transfer",
+        "sampler_h2d_early",
         "sampler_h2d",
         "sampler_resume",
+        "rollout_paused",
         "trainer_release",
         "total_sync",
         "sampler_h2d_pure",
@@ -989,12 +991,14 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     events.clear()
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
-    # The pause runs concurrently with the trainer send, which is requested first.
+    # pause_after_transfer (default): the rollout keeps its requests through the transfer and the H2D into its
+    # staging buffers, and is paused only for the install, which skips the H2D.
     assert events == [
         "update_weights",
-        "abort",
         "init_tpu_sync_on_worker",
         "release_sync_buffers",
+        "h2d_tpu_sync_weights",
+        "abort",
         "install_tpu_sync_weights",
         "set_global_steps",
         "get_model_weights_stats",
@@ -1014,6 +1018,77 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     assert bind_state == [(1, 2, False)] * trainer_ranks  # rebound once, unbound after each transfer
     assert "TPU-SYNC PARITY VERIFIED | Step 1" in caplog.text
     assert "MISMATCH" not in caplog.text
+
+
+@pytest.mark.parametrize("pause_after_transfer", [True, False])
+def test_update_tpu_sync_weights_pause_after_transfer(fake_tpu_sync, worker_ext, pause_after_transfer):
+    tp = trainer_ranks = 2
+    weights = {"current": _trainer_weights(seed=0)}
+    engines = [_trainer_engine(rank) for rank in range(trainer_ranks)]
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    events: list = []
+    manager, _ = _make_manager(
+        engines,
+        lambda rank: iter(weights["current"].items()),
+        samplers,
+        events,
+        pause_after_transfer=pause_after_transfer,
+    )
+
+    # The first sync of a driver neither pauses (step 0) nor runs the early H2D: it allocates the staging buffers.
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert "h2d_tpu_sync_weights" not in events and "abort" not in events
+
+    for step in (1, 2):
+        weights["current"] = _trainer_weights(seed=step)
+        events.clear()
+        metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+        if pause_after_transfer:
+            # Paused only after the transfer and the H2D into the staging buffers.
+            assert events[:6] == [
+                "update_weights",
+                "init_tpu_sync_on_worker",
+                "release_sync_buffers",
+                "h2d_tpu_sync_weights",
+                "abort",
+                "install_tpu_sync_weights",
+            ]
+            assert metrics["timing_s/tpu-sync/sampler_h2d_early"] > 0
+        else:
+            # Paused at the start, concurrently with the trainer send; the install runs the H2D itself.
+            assert events[:5] == [
+                "update_weights",
+                "abort",
+                "init_tpu_sync_on_worker",
+                "release_sync_buffers",
+                "install_tpu_sync_weights",
+            ]
+            assert metrics["timing_s/tpu-sync/sampler_h2d_early"] == 0
+        assert events[-1] == "resume"
+        assert metrics["timing_s/tpu-sync/rollout_paused"] > 0
+        for rank, model in enumerate(models):
+            _assert_state(model, _expected_vllm_state(weights["current"], rank, tp))
+        # One H2D per sync either way: the install skips it after the early H2D.
+        assert [sampler._tpu_sync_ws.h2d_calls for sampler in samplers] == [step + 1] * tp
+
+
+def test_install_skip_h2d_installs_the_staged_weights(fake_tpu_sync, worker_ext):
+    tp = 1
+    model = _FakeVllmModel(tp)
+    (sampler,) = [_make_sampler(worker_ext, 0, tp, model)]
+    events: list = []
+    weights = _trainer_weights(seed=3)
+    manager, _ = _make_manager([_trainer_engine(0)], lambda rank: iter(weights.items()), [sampler], events)
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    ws = sampler._tpu_sync_ws
+    assert ws.h2d_calls == 1
+
+    assert sampler.h2d_tpu_sync_weights() >= 0
+    assert ws.h2d_calls == 2
+    result = sampler.install_tpu_sync_weights(skip_h2d=True)
+    assert ws.h2d_calls == 2 and result["h2d"] < 1.0
+    _assert_state(model, _expected_vllm_state(weights, 0, tp))
 
 
 @pytest.mark.parametrize("backend", ["tpu-sync"])
@@ -1237,9 +1312,17 @@ def test_update_tpu_sync_weights_returns_phase_timings_and_slowest_worker_h2d(fa
     assert set(metrics) == TIMING_KEYS and min(metrics.values()) >= 0
     assert metrics["timing_s/tpu-sync/sampler_h2d_pure"] == 0.75
 
-    for replica in manager.replicas:
-        _rpc_without_results(replica.server_handle._obj, monkeypatch, {"install_tpu_sync_weights"})
+    # Later syncs run the H2D early (pause_after_transfer), so its time comes from h2d_tpu_sync_weights.
+    for sampler, h2d in zip(itertools.chain.from_iterable(samplers), [0.5, 0.25, 0.125, 0.625], strict=True):
+        sampler.h2d_tpu_sync_weights = lambda h2d=h2d: h2d
     metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=2))
+    assert metrics["timing_s/tpu-sync/sampler_h2d_pure"] == 0.625
+
+    for replica in manager.replicas:
+        _rpc_without_results(
+            replica.server_handle._obj, monkeypatch, {"install_tpu_sync_weights", "h2d_tpu_sync_weights"}
+        )
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=3))
     assert set(metrics) == TIMING_KEYS - {"timing_s/tpu-sync/sampler_h2d_pure"}
 
 
