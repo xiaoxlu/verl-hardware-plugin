@@ -28,7 +28,6 @@ from verl.plugin.platform import get_platform
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
-from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import patch_vllm_for_tpu
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import TPU_SYNC_BACKEND, canonical_backend
 
 # vLLM imports the worker extension by name in its worker processes.
@@ -114,12 +113,6 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
 
 class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
     """``vLLMHttpServer`` with the TPU engine arguments."""
-
-    def __init__(self, *args, **kwargs):
-        # This actor builds the vLLM engine and starts its EngineCore process, so patch vLLM before
-        # anything else. The patches carry themselves into the EngineCore and vLLM's workers.
-        patch_vllm_for_tpu()
-        super().__init__(*args, **kwargs)
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         super()._preprocess_engine_kwargs(engine_kwargs)

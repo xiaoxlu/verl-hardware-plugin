@@ -62,9 +62,7 @@ TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
-# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
-# rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
-# rollout agree on the physical layout of a given slice size.
+# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice.
 DEFAULT_TPU_TOPOLOGY_MAP = {
     1: "1,1,1",
     2: "1,2,1",

@@ -10,9 +10,6 @@ upstream verl (which hooks are overridden and what they return) and the launch a
 
 import asyncio
 import importlib
-import multiprocessing.process
-import os
-import pickle
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -22,7 +19,6 @@ import ray
 import ray.util.scheduling_strategies  # noqa: F401  (tpu_vllm reaches it through ``ray.util``)
 
 # Import before any test patches sys.modules, so mock.patch.dict never evicts it.
-from verl_hardware_plugin.accelerators.tpu.rollout import tpu_vllm_patches
 
 VAS = "verl.workers.rollout.vllm_rollout.vllm_async_server"
 
@@ -59,14 +55,11 @@ class _FakeReplica:
 
 @pytest.fixture
 def tpu_vllm():
-    """Import ``tpu_vllm`` against a stubbed ``vllm_async_server``, with ``patch_vllm_for_tpu`` mocked."""
+    """Import ``tpu_vllm`` against a stubbed ``vllm_async_server``."""
     vas = ModuleType(VAS)
     vas.vLLMHttpServer = _FakeHttpServer
     vas.vLLMReplica = _FakeReplica
-    with (
-        mock.patch.dict(sys.modules, {VAS: vas}),
-        mock.patch.object(tpu_vllm_patches, "patch_vllm_for_tpu"),
-    ):
+    with mock.patch.dict(sys.modules, {VAS: vas}):
         sys.modules.pop("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm", None)
         module = importlib.import_module("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm")
         yield module
@@ -109,15 +102,6 @@ def test_vllm_loader_defers_off_tpu_and_picks_tpu_replica_on_tpu():
 # ---------------------------------------------------------------------------
 # TPUvLLMHttpServer / TPUvLLMReplica hooks
 # ---------------------------------------------------------------------------
-
-
-def test_server_patches_vllm_before_upstream_init(tpu_vllm):
-    assert not tpu_vllm.patch_vllm_for_tpu.called  # importing the module patches nothing
-    order = []
-    tpu_vllm.patch_vllm_for_tpu.side_effect = lambda: order.append("patch")
-    with mock.patch.object(_FakeHttpServer, "__init__", lambda self: order.append("upstream init")):
-        tpu_vllm.TPUvLLMHttpServer()
-    assert order == ["patch", "upstream init"]
 
 
 def test_server_engine_kwargs_disable_sleep_mode_and_keep_mp_executor(tpu_vllm):
@@ -271,56 +255,3 @@ def test_launch_tpu_vllm_servers_one_server_per_host(tpu_vllm):
 def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
     with pytest.raises(NotImplementedError, match="data_parallel_size"):
         asyncio.run(tpu_vllm.launch_tpu_vllm_servers(_fake_replica(data_parallel_size=2)))
-
-
-# ---------------------------------------------------------------------------
-# patch_vllm_for_tpu (without vllm-torchtpu installed)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def isolated_patches():
-    """Run patch_vllm_for_tpu with its process-global side effects rolled back afterwards."""
-
-    base_process = multiprocessing.process.BaseProcess
-    saved_init = base_process.__init__
-    had_flag = "_tpu_patched" in base_process.__dict__
-    with mock.patch.object(tpu_vllm_patches, "_PATCHES_APPLIED", False):
-        yield tpu_vllm_patches
-    base_process.__init__ = saved_init
-    if not had_flag and "_tpu_patched" in base_process.__dict__:
-        del base_process._tpu_patched
-
-
-def test_patch_vllm_for_tpu_side_effects_without_torchtpu(isolated_patches):
-    with mock.patch.dict(os.environ):
-        os.environ.pop("VLLM_DISABLE_COMPILE_CACHE", None)
-        isolated_patches.patch_vllm_for_tpu()
-        # vLLM's compile cache is left on (the plugin no longer sets VLLM_DISABLE_COMPILE_CACHE).
-        assert "VLLM_DISABLE_COMPILE_CACHE" not in os.environ
-    assert multiprocessing.process.BaseProcess._tpu_patched is True
-    # The executor patches need vllm-torchtpu, so the guard stays open for a later retry.
-    assert isolated_patches._PATCHES_APPLIED is False
-
-
-def test_patch_vllm_for_tpu_is_a_no_op_once_applied(isolated_patches):
-    isolated_patches._PATCHES_APPLIED = True
-    # vLLM is made unimportable, so getting past the guard would log "Skipping vLLM TPU executor patches".
-    with mock.patch.dict(sys.modules, {"vllm": None}), mock.patch.object(isolated_patches.logger, "debug") as debug:
-        isolated_patches.patch_vllm_for_tpu()
-    debug.assert_not_called()
-
-
-def test_pickleable_process_wrapper_applies_patches_before_target():
-    wrapper = pickle.loads(pickle.dumps(tpu_vllm_patches.PickleableProcessWrapper(len)))
-    with mock.patch.object(tpu_vllm_patches, "patch_vllm_for_tpu") as patch:
-        assert wrapper([1, 2, 3]) == 3
-    patch.assert_called_once_with()
-
-
-def test_multiprocessing_patch_wraps_keyword_and_positional_targets(isolated_patches):
-    isolated_patches.patch_multiprocessing_for_tpu()
-    for process in (multiprocessing.Process(target=len), multiprocessing.Process(None, len)):
-        assert isinstance(process._target, isolated_patches.PickleableProcessWrapper)
-        assert process._target.target is len
-    assert multiprocessing.Process()._target is None

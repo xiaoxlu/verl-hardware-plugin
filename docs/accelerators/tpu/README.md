@@ -37,7 +37,6 @@ verl_hardware_plugin/accelerators/tpu/
 │   └── loss_inputs.py                # Static-shape inputs for verl's unmodified sft_loss / ppo_loss
 ├── rollout/                          # verl core: verl/workers/rollout/
 │   ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
-│   ├── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
 │   ├── direct_install.py             # Table of the model-specific direct `tpu-sync` installs below
 │   ├── moe_weights.py                # vLLM fused-MoE expert weight layouts and writers (shared)
 │   ├── qwen3_5_layout.py             # Direct `tpu-sync` install of Qwen3.5 (GatedDeltaNet, TP-sliced experts)
@@ -66,7 +65,6 @@ tests/accelerators/tpu/
 ├── test_tpu_options.py               # options.py (engine_kwargs.tpu, engine_kwargs.tpu-sync, deprecated env vars)
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
-├── test_tpu_vllm_patches.py          # rollout/tpu_vllm_patches.py
 ├── test_direct_install.py            # rollout/direct_install.py
 ├── test_moe_weights.py               # rollout/moe_weights.py
 ├── test_qwen3_5_layout.py            # rollout/qwen3_5_layout.py
