@@ -278,6 +278,12 @@ class TPUSyncOptions:
             into vLLM's parameters. The engine runs the copy between its steps, so generation stalls for it.
             Generations that finish before the pause used the previous weights and keep their
             ``global_steps`` tag. ``False`` pauses the rollout at the start of the sync, as before.
+        return_after_d2h: Return to the trainer as soon as its weights are copied to host memory, and finish the sync
+            (the transfer to the rollout hosts, the install and the resume) in the background while training goes on.
+            The next sync waits for it first. Applies from the second sync on, with ``pause_after_transfer``, and
+            needs a ``tpu-sync-torch`` whose ``WeightSynchronizer.d2h()`` returns a future. Off by default: until
+            verl waits for a pending sync before validation and at the end of training, a validation right after
+            a sync can run on the previous weights.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
@@ -285,6 +291,7 @@ class TPUSyncOptions:
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
     pause_after_transfer: bool = True
+    return_after_d2h: bool = False
 
     @property
     def verify_norms(self) -> bool:
@@ -303,6 +310,7 @@ _SYNC_KINDS: dict[str, type] = {
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
     "pause_after_transfer": bool,
+    "return_after_d2h": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 

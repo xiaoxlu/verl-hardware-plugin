@@ -86,6 +86,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
 | `pause_after_transfer` | `True` | Keep the rollout's requests running (not aborted) through the trainer export, the transfer and the H2D into its HBM staging buffers, and pause it only for the install into vLLM's parameters. The engine runs the rollout init and the H2D between its steps, so generation stalls for those (about 0.15 s at 8B) but keeps its requests and KV cache. Generations that finish before the pause used the previous weights and keep their `global_steps` tag. The first sync of a run still pauses up front (it allocates the staging buffers). `False` pauses the rollout at the start of every sync. See [Metrics](#metrics). |
+| `return_after_d2h` | `False` | Return to the trainer as soon as its ranks have copied their weights to host memory and freed the device buffers, and finish the sync (transfer, rollout H2D, pause, install, resume) in the background while training goes on. The next sync waits for it first and raises its error, if any. Applies from the second sync on (tpu-sync keeps the weights bound across the first transfer to a rollout topology), with `pause_after_transfer`, and needs a `tpu-sync-torch` whose `WeightSynchronizer.d2h()` returns a future; otherwise the sync runs to the end as before. See [Returning after the D2H](#returning-after-the-d2h). |
 
 ## Rollout install
 
@@ -166,6 +167,9 @@ trainer, log them with the step metrics:
 | `timing_s/tpu-sync/rollout_paused` | From the pause (abort) to the resume |
 | `timing_s/tpu-sync/trainer_release` | Waiting for the trainer to free its send buffers; generation has already resumed |
 | `timing_s/tpu-sync/total_sync` | The whole sync, including the pause |
+| `timing_s/tpu-sync/trainer_d2h` | With `return_after_d2h`: the trainer ranks' own device-to-host copy, on the slowest rank |
+| `timing_s/tpu-sync/wait_previous_sync` | With `return_after_d2h`: waiting for the background part of the previous sync |
+| `tpu-sync/returned_after_d2h` | With `return_after_d2h`: 1 when the sync returned after the trainer's D2H |
 
 `sampler_h2d_pure` and the `verify_parity` checks read the rollout workers' return values, which verl's vLLM server
 passes back from `collective_rpc` (since verl-project/verl#8155). With an older verl, the sync still works, but
@@ -181,6 +185,21 @@ instead: the pause no longer overlaps `trainer_init`, and the transfer and the H
 generation. On 2 × v6e-8 (Qwen3-8B, trainer FSDP8, rollout TP8, `verify_parity=norm`, steps 2–10), `rollout_paused`
 went from 2.09 s to 0.63 s (0.46 s of it is the parity check; 0.78 s including the stalls above) and `update_weights`
 from 2.09 s to 2.35 s.
+
+## Returning after the D2H
+
+With `return_after_d2h`, a sync returns to the trainer after `trainer_init` (which then includes the ranks' own D2H,
+reported as `trainer_d2h`), and the transfer reads the trainer's host staging buffers (`skip_d2h`). The other phases run
+in the background and are reported by the next sync, together with `wait_previous_sync`: the step metrics of a sync
+show the background phases of the sync before it.
+
+Until verl waits for a pending sync itself, two things follow:
+
+* A validation that runs right after a sync can run on the previous weights.
+* When training ends, the background part of the last sync may not finish before the process exits.
+
+`wait_for_tpu_sync_update(manager)` in `tpu_sync_checkpoint_engine.py` waits for the pending sync and returns its
+metrics.
 
 ## Verify
 
